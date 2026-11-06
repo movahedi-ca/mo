@@ -1,5 +1,7 @@
 # MO — Local Resource Assistant
 
+[![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/movahedi-ca/mo?utm_source=readme&utm_medium=badge)
+
 **One queue. One SQLite database. Unix socket only.**  
 No HTTP server. No network port. No LLM.
 
