@@ -285,6 +285,214 @@ pub fn extend(
     Ok(lease)
 }
 
+/// Record a heartbeat. Resets misses, pushes the next due time.
+/// A STALE lease revives to ACTIVE on a fresh heartbeat. E08 when unknown.
+pub fn heartbeat(store: &Store, lease_id: &str, now: i64, cfg: &Config) -> Result<Lease> {
+    let mut lease = match store.get_lease(lease_id)? {
+        Some(l) => l,
+        None => return Err(MoError::e08(format!("lease not found: {lease_id}"))),
+    };
+    if lease.state == "released" || lease.state == "expired" || lease.state == "failed" {
+        return Err(MoError::e08(format!(
+            "lease {lease_id} is {}, no heartbeat accepted",
+            lease.state
+        )));
+    }
+    let revived = lease.state == "stale";
+    lease.state = "active".to_string();
+    lease.heartbeat_misses = 0;
+    lease.heartbeat_due_unix = now + cfg.heartbeat_min * 60;
+    let lease_clone = lease.clone();
+    store.with_tx(|tx| {
+        Store::update_lease_tx(tx, &lease_clone)?;
+        Store::audit_tx(
+            tx,
+            if revived {
+                "heartbeat_revive"
+            } else {
+                "heartbeat"
+            },
+            Some(&lease_clone.agent_id),
+            Some(&lease_clone.job_id),
+            Some(lease_id),
+            Some(&lease_clone.desktop),
+            "heartbeat received",
+            now,
+        )?;
+        Ok(())
+    })?;
+    store.insert_heartbeat(lease_id, now)?;
+    Ok(lease)
+}
+
+/// Sweep: count missed beats for ACTIVE leases.
+/// Miss 1: lease stays ACTIVE, flag warned, audit event.
+/// Miss 2: lease becomes STALE, audit event. Returns stale lease ids.
+pub fn sweep_stale(store: &Store, now: i64, cfg: &Config) -> Result<Vec<String>> {
+    let active = store.list_leases(&["active"])?;
+    let interval = cfg.heartbeat_min * 60;
+    let mut stale = Vec::new();
+    for mut lease in active {
+        let last = store
+            .last_heartbeat(&lease.lease_id)?
+            .unwrap_or(lease.start_unix);
+        let missed = (now - last) / interval;
+        if missed >= cfg.heartbeat_miss && lease.heartbeat_misses < cfg.heartbeat_miss {
+            lease.state = "stale".to_string();
+            lease.heartbeat_misses = missed;
+            let lc = lease.clone();
+            store.with_tx(|tx| {
+                Store::update_lease_tx(tx, &lc)?;
+                Store::audit_tx(
+                    tx,
+                    "stale",
+                    Some(&lc.agent_id),
+                    Some(&lc.job_id),
+                    Some(&lc.lease_id),
+                    Some(&lc.desktop),
+                    &format!("missed {missed} heartbeats"),
+                    now,
+                )?;
+                Ok(())
+            })?;
+            stale.push(lease.lease_id);
+        } else if missed == 1 && lease.heartbeat_misses == 0 {
+            lease.heartbeat_misses = 1;
+            let lc = lease.clone();
+            store.with_tx(|tx| {
+                Store::update_lease_tx(tx, &lc)?;
+                Store::audit_tx(
+                    tx,
+                    "heartbeat_warned",
+                    Some(&lc.agent_id),
+                    Some(&lc.job_id),
+                    Some(&lc.lease_id),
+                    Some(&lc.desktop),
+                    "missed 1 heartbeat",
+                    now,
+                )?;
+                Ok(())
+            })?;
+        }
+    }
+    Ok(stale)
+}
+
+/// Mark ACTIVE leases past their end as EXPIRED. Reclaim frees them later.
+pub fn expire_leases(store: &Store, now: i64) -> Result<Vec<String>> {
+    let active = store.list_leases(&["active"])?;
+    let mut expired = Vec::new();
+    for lease in active {
+        if now > lease.end_unix {
+            let lc = lease.clone();
+            store.with_tx(|tx| {
+                Store::update_lease_state_tx(tx, &lc.lease_id, "expired")?;
+                Store::audit_tx(
+                    tx,
+                    "expired",
+                    Some(&lc.agent_id),
+                    Some(&lc.job_id),
+                    Some(&lc.lease_id),
+                    Some(&lc.desktop),
+                    "lease end reached",
+                    now,
+                )?;
+                Ok(())
+            })?;
+            expired.push(lease.lease_id);
+        }
+    }
+    Ok(expired)
+}
+
+/// Reclaim probe: what the desktop actually looks like right now.
+#[derive(Debug, Clone, Copy)]
+pub struct ReclaimProbe {
+    pub cdp_ok: bool,
+    pub chrome_alive: bool,
+    pub lock_held: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReclaimOutcome {
+    /// Lease stays STALE/EXPIRED. MO never kills a live Chrome blindly.
+    KeptStale(String),
+    /// Desktop was dead. Lease released, desktop freed.
+    Released,
+}
+
+/// Reclaim check for a STALE or EXPIRED lease, after the grace period.
+/// Grace runs from the last heartbeat plus 2 missed intervals.
+pub fn reclaim_check(
+    store: &Store,
+    lease_id: &str,
+    now: i64,
+    cfg: &Config,
+    probe: &ReclaimProbe,
+) -> Result<ReclaimOutcome> {
+    let lease = match store.get_lease(lease_id)? {
+        Some(l) => l,
+        None => return Err(MoError::e08(format!("lease not found: {lease_id}"))),
+    };
+    if lease.state != "stale" && lease.state != "expired" {
+        return Err(MoError::e08(format!(
+            "lease {lease_id} is {}, reclaim needs stale or expired",
+            lease.state
+        )));
+    }
+    let last = store.last_heartbeat(lease_id)?.unwrap_or(lease.start_unix);
+    let stale_at = last + cfg.heartbeat_miss * cfg.heartbeat_min * 60;
+    if now < stale_at + cfg.reclaim_grace_min * 60 {
+        return Ok(ReclaimOutcome::KeptStale(
+            "grace period not over".to_string(),
+        ));
+    }
+    if probe.cdp_ok && probe.chrome_alive {
+        store.audit(
+            "reclaim_kept",
+            Some(&lease.agent_id),
+            Some(&lease.job_id),
+            Some(lease_id),
+            Some(&lease.desktop),
+            "CDP responds and Chrome lives: no kill",
+            now,
+        )?;
+        return Ok(ReclaimOutcome::KeptStale(
+            "CDP responds and Chrome lives".to_string(),
+        ));
+    }
+    if !probe.cdp_ok && probe.chrome_alive {
+        store.audit(
+            "reclaim_flagged",
+            Some(&lease.agent_id),
+            Some(&lease.job_id),
+            Some(lease_id),
+            Some(&lease.desktop),
+            "CDP dead but Chrome lives: operator flagged, no kill",
+            now,
+        )?;
+        return Ok(ReclaimOutcome::KeptStale(
+            "CDP dead but Chrome lives: operator flagged".to_string(),
+        ));
+    }
+    // CDP dead and Chrome dead: free the desktop.
+    store.with_tx(|tx| {
+        Store::update_lease_state_tx(tx, lease_id, "released")?;
+        Store::audit_tx(
+            tx,
+            "reclaim",
+            Some(&lease.agent_id),
+            Some(&lease.job_id),
+            Some(lease_id),
+            Some(&lease.desktop),
+            "CDP dead and Chrome dead: desktop freed",
+            now,
+        )?;
+        Ok(())
+    })?;
+    Ok(ReclaimOutcome::Released)
+}
+
 /// Build a Lease row from a LeaseRequest for direct use in tests.
 pub fn lease_from_request(req: &LeaseRequest, desktop: &str, now: i64) -> Lease {
     let (display, cdp_port, vnc_port, profile) = desktop_binding(desktop);
@@ -569,5 +777,121 @@ mod tests {
     fn request_type_used() {
         let r = LeaseRequest::default();
         assert_eq!(r.cpu_cores, 1);
+    }
+
+    fn granted_lease() -> (Store, String, String, Config, i64) {
+        let (s, p) = tmp_store();
+        let cfg = Config::from_env();
+        let req = queued_req();
+        let now = now_unix();
+        let g = grant(
+            &s,
+            &req,
+            "vd1",
+            &inv_ok(),
+            &cfg,
+            now,
+            &ok_provision,
+            &ok_stop,
+        )
+        .unwrap();
+        (s, p, g.lease_id, cfg, now)
+    }
+
+    #[test]
+    fn heartbeat_resets_misses_and_due() {
+        let (s, p, id, cfg, now) = granted_lease();
+        let l = heartbeat(&s, &id, now + 60, &cfg).unwrap();
+        assert_eq!(l.heartbeat_misses, 0);
+        assert_eq!(l.heartbeat_due_unix, now + 60 + 300);
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn two_missed_beats_go_stale() {
+        let (s, p, id, cfg, now) = granted_lease();
+        // One miss: warned, still active.
+        let stale = sweep_stale(&s, now + 301, &cfg).unwrap();
+        assert!(stale.is_empty());
+        let l = s.get_lease(&id).unwrap().unwrap();
+        assert_eq!(l.state, "active");
+        assert_eq!(l.heartbeat_misses, 1);
+        // Two misses: STALE.
+        let stale = sweep_stale(&s, now + 601, &cfg).unwrap();
+        assert_eq!(stale, vec![id.clone()]);
+        assert_eq!(s.get_lease(&id).unwrap().unwrap().state, "stale");
+        // A fresh heartbeat revives it.
+        let l = heartbeat(&s, &id, now + 602, &cfg).unwrap();
+        assert_eq!(l.state, "active");
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn reclaim_releases_only_when_dead() {
+        let (s, p, id, cfg, now) = granted_lease();
+        let _ = sweep_stale(&s, now + 601, &cfg).unwrap();
+        let after_grace = now + 601 + 5 * 60 + 1;
+        // CDP alive + Chrome alive: kept.
+        let probe = ReclaimProbe {
+            cdp_ok: true,
+            chrome_alive: true,
+            lock_held: true,
+        };
+        assert_eq!(
+            reclaim_check(&s, &id, after_grace, &cfg, &probe).unwrap(),
+            ReclaimOutcome::KeptStale("CDP responds and Chrome lives".to_string())
+        );
+        // CDP dead + Chrome alive: kept, flagged.
+        let probe = ReclaimProbe {
+            cdp_ok: false,
+            chrome_alive: true,
+            lock_held: true,
+        };
+        assert!(matches!(
+            reclaim_check(&s, &id, after_grace, &cfg, &probe).unwrap(),
+            ReclaimOutcome::KeptStale(_)
+        ));
+        // CDP dead + Chrome dead: released.
+        let probe = ReclaimProbe {
+            cdp_ok: false,
+            chrome_alive: false,
+            lock_held: false,
+        };
+        assert_eq!(
+            reclaim_check(&s, &id, after_grace, &cfg, &probe).unwrap(),
+            ReclaimOutcome::Released
+        );
+        assert_eq!(s.get_lease(&id).unwrap().unwrap().state, "released");
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn reclaim_respects_grace() {
+        let (s, p, id, cfg, now) = granted_lease();
+        let _ = sweep_stale(&s, now + 601, &cfg).unwrap();
+        let probe = ReclaimProbe {
+            cdp_ok: false,
+            chrome_alive: false,
+            lock_held: false,
+        };
+        assert!(matches!(
+            reclaim_check(&s, &id, now + 602, &cfg, &probe).unwrap(),
+            ReclaimOutcome::KeptStale(_)
+        ));
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn expiry_marks_expired() {
+        let (s, p, id, cfg, now) = granted_lease();
+        let expired = expire_leases(&s, now + 1801).unwrap();
+        assert_eq!(expired, vec![id.clone()]);
+        assert_eq!(s.get_lease(&id).unwrap().unwrap().state, "expired");
+        drop(s);
+        let _ = std::fs::remove_file(p);
     }
 }
