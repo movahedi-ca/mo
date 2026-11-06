@@ -1,0 +1,28 @@
+[package]
+name = "mo"
+version = "0.1.0"
+edition = "2021"
+description = "MO Local Resource Assistant: one queue, leases, heartbeat, battery gates, dashboard"
+license = "MIT"
+
+[lib]
+name = "mo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mo-daemon"
+path = "src/main.rs"
+
+[[bin]]
+name = "mo-cli"
+path = "src/bin/mo-cli.rs"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = 2
