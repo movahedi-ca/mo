@@ -1,0 +1,36 @@
+# MO implementation ledger
+# V3 playbook section 12.3. Updated per task.
+# Status values: completed_verified, blocked, not_started.
+
+tasks:
+  TASK-003: { status: completed_verified, evidence: "cargo build, cargo test 4 passed" }
+  TASK-004: { status: completed_verified, evidence: "cargo test 8 passed" }
+  TASK-005: { status: completed_verified, evidence: "cargo test 12 passed" }
+  TASK-008: { status: completed_verified, evidence: "cargo test 18 passed" }
+  TASK-006: { status: completed_verified, evidence: "cargo test 26 passed" }
+  TASK-007: { status: completed_verified, evidence: "cargo test 34 passed" }
+  TASK-009: { status: completed_verified, evidence: "cargo test 39 passed" }
+  TASK-014: { status: completed_verified, evidence: "cargo test 44 passed" }
+  TASK-010: { status: completed_verified, evidence: "cargo test 51 passed" }
+  TASK-011: { status: completed_verified, evidence: "cargo test 56 passed" }
+  TASK-012: { status: completed_verified, evidence: "cargo test 60 passed" }
+  TASK-013: { status: completed_verified, evidence: "cargo test 61 passed, socket round trip live" }
+  TASK-019: { status: completed_verified, evidence: "cargo test 65 passed" }
+
+toolchain: rustc 1.99.1, installed locally via rustup stable (this host had no rustc)
+deps: rusqlite 0.32, serde 1, serde_json 1, clap 4, uuid 1 (five runtime deps, Cargo.lock pinned)
+
+deviations:
+  - systemd timer unit not created: the 60s inventory snapshot and 30s
+    dashboard refresh run inside the daemon. A separate timer unit would
+    duplicate that work. Service unit covers the daemon. Noted in the unit file.
+  - ARM64 compile check blocked: no aarch64-linux-gnu-gcc on this host.
+    `cargo check --target aarch64-unknown-linux-gnu` fails in libsqlite3-sys
+    build script (ToolNotFound). Not a code issue. TASK-020 owner to verify
+    where a cross compiler exists.
+
+notes:
+  - No deploy done. No remote configured. No push made.
+  - Daemon smoke tested live on this host (debug build, /tmp paths):
+    request -> granted, status, heartbeat, extend, release, health all JSON OK.
+  - Socket round trip test covers request to release over a live Unix socket.
