@@ -130,3 +130,4 @@ fix_run_2026_11_06:
     - "deploy run: deployment NOT done in this run"
   final_gate: "cargo test --release: 94 passed, 0 failed (lib); cargo clippy --release --all-targets: 0 warnings; cargo fmt --check: clean"
   benchmarks_after: "implementation/benchmarks.md post-fix section: status median 3ms max 4ms; cpu-ram grant 4ms; bridge-needing request with bridge down 3ms (was 607ms); idle RSS 5.4MB (was 4.7MB); DB 0.22MB at 1001 leases (was 0.65MB)"
+  push_2026_11_06: "remote main b6d086a (API commit via push_files.py, --by main-chat). Local master (31 commits) and remote main shared 0 commits, so a plain git push was impossible; no force-push was used and remote history is preserved. Remote tree verified identical to local tree (git diff origin/main HEAD empty, blob-for-blob match). Local branch is master; remote branch is main. Full per-commit history lives only in the local repo."
