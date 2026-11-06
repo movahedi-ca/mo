@@ -359,6 +359,11 @@ pub struct Lease {
     pub extensions: i64,
     pub last_heartbeat_unix: i64,
     pub created_unix: i64,
+    /// 1 when MO itself started this desktop (cold start), 0 when the
+    /// desktop was already up (warm reuse). Release and rollback stop a
+    /// desktop only when this is 1, so MO never kills a desktop that
+    /// another agent or the operator started outside MO.
+    pub started_desktop: i64,
 }
 
 /// One queued request row.

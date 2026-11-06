@@ -121,6 +121,10 @@ pub fn profile_lock_free(profile: &str) -> bool {
 
 /// Start a desktop via the vd script, then wait for CDP.
 /// Main display is already up and is never started here.
+/// Idempotent: when CDP already responds on the desktop's port, the
+/// desktop is already up and vd-start is not run. vd-start exits 1 on
+/// an already-running desktop, so running it unconditionally made every
+/// grant for a warm desktop fail (live host, 2026-11-06: vd1-vd6 up).
 pub fn start_desktop(id: &str) -> Result<Desktop> {
     if id == "main-display" {
         return Ok(list_desktops().into_iter().next().unwrap());
@@ -132,6 +136,18 @@ pub fn start_desktop(id: &str) -> Result<Desktop> {
     if !(1..=10).contains(&n) {
         return Err(MoError::e02(format!("unknown desktop: {id}")));
     }
+    let port = 9332 + n;
+    if cdp_ok(port) {
+        return Ok(Desktop {
+            id: id.to_string(),
+            display: format!(":{}", n + 1),
+            cdp_port: Some(port),
+            vnc_port: Some(5902 + n),
+            profile: Some(format!("{}/chrome-vd{n}", crate::core::profile_root())),
+            up: true,
+            leased: false,
+        });
+    }
     let status = std::process::Command::new(vd_start_script())
         .arg(id)
         .status()
@@ -139,7 +155,6 @@ pub fn start_desktop(id: &str) -> Result<Desktop> {
     if !status.success() {
         return Err(MoError::e04(format!("vd-start {id} exited {status}")));
     }
-    let port = 9332 + n;
     if !wait_cdp(port, 10) {
         return Err(MoError::e04(format!(
             "CDP never responded on vd{n} port {port}"
@@ -157,15 +172,23 @@ pub fn start_desktop(id: &str) -> Result<Desktop> {
 }
 
 /// Provision step for a lease grant: start and wait for CDP.
-/// Start a desktop for a grant. Battery-gated like expand: no new
-/// vd start at Warn or worse. A host with no battery sensor has no
-/// battery gate, so a battery-less host with desktops can still start one.
-pub fn provision_desktop(id: &str) -> Result<()> {
+/// Returns true when MO started the desktop (cold start), false when
+/// the desktop was already up (warm reuse). A warm desktop needs no
+/// vd-start and no battery gate: nothing new is started, so Warn must
+/// not block reusing a desktop that is already running.
+pub fn provision_desktop(id: &str) -> Result<bool> {
+    if id != "main-display" && id != "none" {
+        if let Ok(n) = id.trim_start_matches("vd").parse::<i64>() {
+            if (1..=10).contains(&n) && cdp_ok(9332 + n) {
+                return Ok(false);
+            }
+        }
+    }
     if let Some(b) = crate::battery::read_battery() {
         let state = crate::battery::effective_state(Some(&b));
         crate::battery::can_start_vd(state)?;
     }
-    start_desktop(id).map(|_| ())
+    start_desktop(id).map(|_| true)
 }
 
 /// Stop a desktop via the vd script. One retry, then the desktop is flagged.
@@ -410,6 +433,32 @@ mod tests {
         crate::battery::set_test_battery(None);
     }
 
+    /// Patch 11: provision of a warm desktop returns Ok(false) without
+    /// running vd-start, even when the start script would fail and the
+    /// battery is at Warn. A listener stands in for a live CDP port.
+    #[test]
+    fn provision_warm_desktop_returns_false_without_starting() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:9333").unwrap();
+        let prev = std::env::var("MO_VD_START_SCRIPT").ok();
+        std::env::set_var("MO_VD_START_SCRIPT", "/bin/false");
+        use crate::core::{Battery, BatteryState};
+        crate::battery::set_test_battery(Some(Battery {
+            pct: Some(15),
+            charging: false,
+            present: true,
+            state: BatteryState::Warn,
+        }));
+        let started = provision_desktop("vd1").unwrap();
+        assert!(!started);
+        crate::battery::set_test_battery(None);
+        match prev {
+            Some(v) => std::env::set_var("MO_VD_START_SCRIPT", v),
+            None => std::env::remove_var("MO_VD_START_SCRIPT"),
+        }
+        drop(listener);
+    }
+
     #[test]
     fn fold_main_display_is_e14() {
         let p = format!(
@@ -481,6 +530,7 @@ mod tests {
             extensions: 0,
             last_heartbeat_unix: 0,
             created_unix: now,
+            started_desktop: 1,
         };
         s.with_tx(|tx| {
             Store::insert_lease_tx(tx, &lease)?;

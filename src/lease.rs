@@ -82,8 +82,9 @@ pub fn desktop_binding(desktop: &str) -> (String, Option<i64>, Option<i64>, Opti
 }
 
 /// Grant a lease through two-phase reservation.
-/// `provision` starts the desktop and waits for CDP (up to 10s).
-/// `stop` stops a desktop after a failed provision.
+/// `provision` starts the desktop and waits for CDP (up to 10s), and
+/// returns true when it started the desktop, false when the desktop was
+/// already up. `stop` stops a desktop after a failed provision.
 /// Both are closures so tests can inject failures without a live desktop.
 #[allow(clippy::too_many_arguments)]
 pub fn grant(
@@ -93,7 +94,7 @@ pub fn grant(
     inv: &Inventory,
     cfg: &Config,
     now: i64,
-    provision: &dyn Fn(&str) -> Result<()>,
+    provision: &dyn Fn(&str) -> Result<bool>,
     stop: &dyn Fn(&str) -> Result<()>,
 ) -> Result<Grant> {
     // Guards on a fresh inventory read. V3 section 9.3.
@@ -133,6 +134,7 @@ pub fn grant(
         extensions: 0,
         last_heartbeat_unix: 0,
         created_unix: now,
+        started_desktop: 0,
     };
     // Phase 1: reserve in one transaction.
     let reserve = store.with_tx(|tx| {
@@ -170,21 +172,30 @@ pub fn grant(
         return Err(e);
     }
     // Phase 2: provision. Desktop start and CDP wait happen outside the tx.
+    // `started` records whether MO started the desktop (true) or reused
+    // one that was already up (false). Only a desktop MO started may ever
+    // be stopped by rollback or release.
+    let mut started = false;
     if desktop != "none" {
-        if let Err(e) = provision(desktop) {
-            rollback(store, &lease, req, desktop, now, &e.message, stop);
-            return Err(MoError::e04(format!(
-                "provision failed for {desktop}: {}",
-                e.message
-            )));
+        match provision(desktop) {
+            Ok(s) => started = s,
+            Err(e) => {
+                rollback(store, &lease, req, desktop, now, &e.message, stop, true);
+                return Err(MoError::e04(format!(
+                    "provision failed for {desktop}: {}",
+                    e.message
+                )));
+            }
         }
     }
     // Phase 3: commit. Lease becomes ACTIVE, one audit row, same transaction.
     // A failure here rolls back: the reservation is deleted, the lease is
-    // marked failed, and the provisioned desktop is stopped. The lease is
-    // never left in "reserving" with a desktop up.
+    // marked failed, and a desktop MO started is stopped. A warm desktop
+    // is never stopped. The lease is never left in "reserving" with a
+    // desktop up.
     if let Err(e) = store.with_tx(|tx| {
         Store::update_lease_state_tx(tx, &lease_id, "active")?;
+        Store::update_lease_started_tx(tx, &lease_id, started as i64)?;
         Store::audit_tx(
             tx,
             "grant",
@@ -197,7 +208,7 @@ pub fn grant(
         )?;
         Ok(())
     }) {
-        rollback(store, &lease, req, desktop, now, &e.message, stop);
+        rollback(store, &lease, req, desktop, now, &e.message, stop, started);
         return Err(e);
     }
     Ok(Grant {
@@ -214,7 +225,10 @@ pub fn grant(
     })
 }
 
-/// Roll back a failed grant: delete the reservation, mark FAILED, audit, stop.
+/// Roll back a failed grant: delete the reservation, mark FAILED, audit,
+/// and stop the desktop only when MO started it (`started` is true).
+/// A warm desktop is never stopped: it belongs to whoever started it.
+#[allow(clippy::too_many_arguments)]
 fn rollback(
     store: &Store,
     lease: &Lease,
@@ -223,6 +237,7 @@ fn rollback(
     now: i64,
     reason: &str,
     stop: &dyn Fn(&str) -> Result<()>,
+    started: bool,
 ) {
     let _ = store.with_tx(|tx| {
         Store::delete_reservations_tx(tx, &lease.lease_id)?;
@@ -240,8 +255,8 @@ fn rollback(
         Ok(())
     });
     // Never stop the main display or a no-desktop lease. Only vd desktops
-    // are stopped, and only when one was actually provisioned.
-    if desktop.starts_with("vd") {
+    // that MO itself started are stopped.
+    if started && desktop.starts_with("vd") {
         let _ = stop(desktop);
     }
 }
@@ -279,7 +294,10 @@ pub fn release(
         )?;
         Ok(())
     })?;
-    if lease.desktop.starts_with("vd") {
+    // Stop the desktop only when MO started it. A warm desktop that was
+    // already up belongs to whoever started it; stopping it on release
+    // would kill live work outside MO.
+    if lease.started_desktop == 1 && lease.desktop.starts_with("vd") {
         if let Err(e) = stop(&lease.desktop) {
             let reason = format!("stop failed on release: {}", e.message);
             let _ = store.audit(
@@ -706,6 +724,7 @@ pub fn lease_from_request(req: &LeaseRequest, desktop: &str, now: i64) -> Lease 
         extensions: 0,
         last_heartbeat_unix: 0,
         created_unix: now,
+        started_desktop: 0,
     }
 }
 
@@ -754,13 +773,16 @@ mod tests {
         }
     }
 
-    fn ok_provision(_d: &str) -> Result<()> {
-        Ok(())
+    fn ok_provision(_d: &str) -> Result<bool> {
+        Ok(true)
+    }
+    fn warm_provision(_d: &str) -> Result<bool> {
+        Ok(false)
     }
     fn ok_stop(_d: &str) -> Result<()> {
         Ok(())
     }
-    fn fail_provision(_d: &str) -> Result<()> {
+    fn fail_provision(_d: &str) -> Result<bool> {
         Err(MoError::e04("CDP never responded"))
     }
 
@@ -939,6 +961,112 @@ mod tests {
         )
         .unwrap();
         assert_eq!(g.desktop, "vd1");
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// Patch 11: a grant for a warm desktop records started_desktop=0,
+    /// and release does not stop a desktop MO did not start.
+    #[test]
+    fn grant_warm_desktop_records_not_started_and_release_does_not_stop() {
+        use std::sync::Mutex;
+        let (s, p) = tmp_store();
+        let cfg = Config::from_env();
+        let req = queued_req();
+        let g = grant(
+            &s,
+            &req,
+            "vd1",
+            &inv_ok(),
+            &cfg,
+            now_unix(),
+            &warm_provision,
+            &ok_stop,
+        )
+        .unwrap();
+        let lease = s.get_lease(&g.lease_id).unwrap().unwrap();
+        assert_eq!(lease.started_desktop, 0);
+        let stopped = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stopped2 = stopped.clone();
+        let record_stop = move |d: &str| {
+            stopped2.lock().unwrap().push(d.to_string());
+            Ok(())
+        };
+        assert!(release(&s, &g.lease_id, now_unix(), &record_stop).unwrap());
+        assert!(stopped.lock().unwrap().is_empty());
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// Patch 11: a grant for a cold desktop records started_desktop=1,
+    /// and release stops it.
+    #[test]
+    fn grant_cold_desktop_records_started_and_release_stops() {
+        use std::sync::Mutex;
+        let (s, p) = tmp_store();
+        let cfg = Config::from_env();
+        let req = queued_req();
+        let g = grant(
+            &s,
+            &req,
+            "vd1",
+            &inv_ok(),
+            &cfg,
+            now_unix(),
+            &ok_provision,
+            &ok_stop,
+        )
+        .unwrap();
+        let lease = s.get_lease(&g.lease_id).unwrap().unwrap();
+        assert_eq!(lease.started_desktop, 1);
+        let stopped = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stopped2 = stopped.clone();
+        let record_stop = move |d: &str| {
+            stopped2.lock().unwrap().push(d.to_string());
+            Ok(())
+        };
+        assert!(release(&s, &g.lease_id, now_unix(), &record_stop).unwrap());
+        assert_eq!(stopped.lock().unwrap().as_slice(), ["vd1"]);
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// Patch 11: a phase-3 failure on a warm desktop rolls back without
+    /// stopping it. The trigger fails any move to active.
+    #[test]
+    fn phase3_failure_on_warm_desktop_does_not_stop() {
+        use std::sync::Mutex;
+        let (s, p) = tmp_store();
+        let cfg = Config::from_env();
+        let req = queued_req();
+        s.with_tx(|tx| {
+            tx.execute_batch(
+                "CREATE TRIGGER fail_commit BEFORE UPDATE ON leases
+                 WHEN NEW.state='active' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let stopped = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stopped2 = stopped.clone();
+        let record_stop = move |d: &str| {
+            stopped2.lock().unwrap().push(d.to_string());
+            Ok(())
+        };
+        let err = grant(
+            &s,
+            &req,
+            "vd1",
+            &inv_ok(),
+            &cfg,
+            now_unix(),
+            &warm_provision,
+            &record_stop,
+        )
+        .unwrap_err();
+        let _ = err;
+        assert_eq!(s.list_leases(&["failed"]).unwrap().len(), 1);
+        assert!(stopped.lock().unwrap().is_empty());
         drop(s);
         let _ = std::fs::remove_file(p);
     }

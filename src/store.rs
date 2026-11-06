@@ -7,7 +7,7 @@ use crate::core::{AuditEvent, Lease, MoError, QueuedRequest, Result};
 use rusqlite::{params, Connection, Transaction};
 use std::sync::Mutex;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS leases (
   heartbeat_misses INTEGER NOT NULL DEFAULT 0,
   extensions INTEGER NOT NULL DEFAULT 0,
   last_heartbeat_unix INTEGER NOT NULL DEFAULT 0,
-  created_unix INTEGER NOT NULL
+  created_unix INTEGER NOT NULL,
+  started_desktop INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_desktop_active
   ON leases(desktop)
@@ -112,6 +113,35 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_taken ON inventory_snapshots(taken_unix
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+/// Migrate a v2 database to v3. Idempotent: every step checks first.
+/// Adds `started_desktop` to leases: 1 when MO started the desktop,
+/// 0 when it reused one that was already up. Existing rows default 0,
+/// which is the safe value: release never stops a pre-existing desktop.
+fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
+    let has_col = |table: &str, col: &str| -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == col {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if !has_col("leases", "started_desktop")? {
+        conn.execute(
+            "ALTER TABLE leases ADD COLUMN started_desktop INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    conn.execute(
+        "UPDATE schema_meta SET value='3' WHERE key='schema_version'",
+        [],
+    )?;
+    Ok(())
 }
 
 /// Migrate a v1 database to v2. Idempotent: every step checks first.
@@ -221,6 +251,9 @@ impl Store {
                 }
                 if n == 1 {
                     migrate_v1_to_v2(&conn)?;
+                    migrate_v2_to_v3(&conn)?;
+                } else if n == 2 {
+                    migrate_v2_to_v3(&conn)?;
                 }
             }
         }
@@ -557,8 +590,8 @@ impl Store {
             "INSERT INTO leases(lease_id, agent_id, job_id, resource_class, desktop, display,
              cdp_port, vnc_port, profile, cpu_cores, mem_mb, state, start_unix, end_unix,
              heartbeat_due_unix, heartbeat_misses, extensions, last_heartbeat_unix,
-             created_unix)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+             created_unix, started_desktop)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 lease.lease_id,
                 lease.agent_id,
@@ -579,6 +612,7 @@ impl Store {
                 lease.extensions,
                 lease.last_heartbeat_unix,
                 lease.created_unix,
+                lease.started_desktop,
             ],
         )?;
         Ok(())
@@ -593,7 +627,7 @@ impl Store {
             "SELECT lease_id, agent_id, job_id, resource_class, desktop, display,
              cdp_port, vnc_port, profile, cpu_cores, mem_mb, state, start_unix, end_unix,
              heartbeat_due_unix, heartbeat_misses, extensions, last_heartbeat_unix,
-             created_unix FROM leases WHERE lease_id=?1",
+             created_unix, started_desktop FROM leases WHERE lease_id=?1",
         )?;
         let mut rows = stmt.query(params![lease_id])?;
         if let Some(row) = rows.next()? {
@@ -618,7 +652,7 @@ impl Store {
             "SELECT lease_id, agent_id, job_id, resource_class, desktop, display,
              cdp_port, vnc_port, profile, cpu_cores, mem_mb, state, start_unix, end_unix,
              heartbeat_due_unix, heartbeat_misses, extensions, last_heartbeat_unix,
-             created_unix
+             created_unix, started_desktop
              FROM leases WHERE state IN ({placeholders}) ORDER BY created_unix ASC"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -638,6 +672,20 @@ impl Store {
         tx.execute(
             "UPDATE leases SET state=?1 WHERE lease_id=?2",
             params![state, lease_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record whether MO started the desktop for this lease. Set in the
+    /// same transaction as the phase-3 commit to active.
+    pub fn update_lease_started_tx(
+        tx: &Transaction<'_>,
+        lease_id: &str,
+        started: i64,
+    ) -> Result<()> {
+        tx.execute(
+            "UPDATE leases SET started_desktop=?1 WHERE lease_id=?2",
+            params![started, lease_id],
         )?;
         Ok(())
     }
@@ -1053,6 +1101,7 @@ fn row_to_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
         extensions: row.get(16)?,
         last_heartbeat_unix: row.get(17)?,
         created_unix: row.get(18)?,
+        started_desktop: row.get(19)?,
     })
 }
 
@@ -1114,6 +1163,7 @@ mod tests {
             extensions: 0,
             last_heartbeat_unix: 0,
             created_unix: now,
+            started_desktop: 0,
         }
     }
 
@@ -1166,9 +1216,12 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, "2");
+        // v1 -> v2 -> v3 chain: version lands on 3, and the migrated
+        // row gets the safe started_desktop default 0.
+        assert_eq!(v, "3");
         let old = s.get_lease("mo-old-1").unwrap().unwrap();
         assert_eq!(old.last_heartbeat_unix, 1200);
+        assert_eq!(old.started_desktop, 0);
         // DEFECT-001: two cpu-ram leases (desktop 'none') must coexist now.
         let now = now_unix();
         for id in ["mo-new-1", "mo-new-2"] {
