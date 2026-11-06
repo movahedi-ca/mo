@@ -521,7 +521,7 @@ impl Store {
             .lock()
             .map_err(|_| MoError::e10("store lock poisoned"))?;
         let mut stmt = conn.prepare(
-            "SELECT COALESCE(SUM(cpu_cores),0), COALESCE(SUM(mem_mb),0) FROM reservations r
+            "SELECT COALESCE(SUM(r.cpu_cores),0), COALESCE(SUM(r.mem_mb),0) FROM reservations r
              JOIN leases l ON l.lease_id = r.lease_id
              WHERE l.state IN ('reserving','granted','active','stale','extension_pending')",
         )?;
