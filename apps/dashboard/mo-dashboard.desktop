@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=MO Dashboard
+Comment=MO resource assistant dashboard, fullscreen
+Exec=/home/auto/.local/bin/mo-dashboard
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;

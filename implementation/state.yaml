@@ -169,8 +169,25 @@ deploy_2026_11_06:
     readme_collision: "remote main gained a comprehensive README (d8ffea0c) + gitdiagram badge (0f3ed2c7) from another session during the deploy window, 16:46-16:48 EST. Kept as is, synced into local README (commit c68bc94). It claims 94 tests; the count is 99 after Patch 12."
   runbook: "implementation/runbook.md"
   open:
-    - "dashboard tab on :1 not pinned (see above)"
+    - "dashboard tab on :1 not pinned: SUPERSEDED 2026-11-06 17:25 EST by the standalone MO Dashboard app (apps/dashboard/), which shows the dashboard fullscreen on :1 with no browser at all; the pinned tab is no longer needed"
     - "TEST-010 real host reboot not run; no safe window"
     - "TASK-020 ARM64 still blocked: no cross linker"
     - "README test count stale (94 vs 99); fix on next README touch"
     - "no Oracle VM exists; no Oracle adapter test has run"
+
+dashboard_app_2026_11_06:
+  verdict: "LIVE on :1 since 17:25 EST, standalone app, no Chrome for the display"
+  language: "Rust (shipped). cargo 1.99.1 via rustup on the VM; webkit2gtk 2.54.0; crate webkit2gtk 2.0.2 + gtk 0.18. C fallback (apps/dashboard/mo-dashboard.c) written, never compiled or run."
+  binary: "~/.local/bin/mo-dashboard, 326 KB, release (opt-level 3, thin LTO, codegen-units 1, strip)"
+  source: "apps/dashboard/ (Cargo.toml, Cargo.lock, src/main.rs, mo-dashboard.c, mo-dashboard.desktop, README.md)"
+  window: "one borderless fullscreen window on :1 (gtk Window fullscreen + set_decorated(false)), on top of main Chrome; Chrome tabs untouched behind it"
+  url: "file:///home/auto/jobs/mo/dashboard.html, loaded directly; WebContext sandbox disabled in code (set_sandbox_enabled(false), needs Cargo feature v2_26)"
+  autostart: "~/.config/autostart/mo-dashboard.desktop (MO Dashboard)"
+  verified: ":1 screenshot 17:25 EST: dashboard edge to edge, MO character visible top right, no browser UI, updated 17:24 EST. Chrome tabs intact (CDP: dashboard, 2x Career Centre, about:blank). mo-daemon still up."
+  step1_surf: "surf 2.1 installed, ran fullscreen on :1 ~17:15 EST as the fast step. WebKit sandbox denied the live file path (Permission denied even with WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1); same file in /tmp loaded. Live file served over loopback HTTP (python3 http.server 127.0.0.1:8931) for that step only; shim stopped 17:25 EST when the app took over; surf killed."
+  build_fixes: "WebContext::new() unusable in webkit2gtk 2.0.2 (use inherent default() -> Option); gtk 0.18 has no gtk::Inhibit (use connect_destroy); set_sandbox_enabled needs feature v2_26; one bad tar transfer put main.rs in the wrong path (fixed by mv into src/)"
+  open:
+    - "vd1-vd6 desktops went down ~17:13:39-17:14:29 EST (chrome processes 106 -> 24, desktops_up 7 -> 1). Main :1 Chrome and all 4 tabs verified intact via CDP. MO audit shows only vd1 freed by reclaim (CDP dead + Chrome dead, 17:13:39 EST); no fold/stop events for vd2-vd6, no OOM kills, no cron/timer, no vd-stop invocation found. Cause unknown; signature matches a vd-stop.sh all by another session. MO can re-expand vds on demand when jobs queue."
+    - ":0 physical screen still shows the :0 kiosk Chrome frame (tab strip + address bar) around the noVNC view; the :1 content inside it is now the fullscreen app. Making :0 itself frameless needs the :0 viewer relaunched in kiosk mode (no WM on :0, F11 does not work there). Not done in this run."
+    - "TEST-010 real host reboot not run; no safe window"
+    - "TASK-020 ARM64 still blocked: no cross linker"
