@@ -131,3 +131,46 @@ fix_run_2026_11_06:
   final_gate: "cargo test --release: 94 passed, 0 failed (lib); cargo clippy --release --all-targets: 0 warnings; cargo fmt --check: clean"
   benchmarks_after: "implementation/benchmarks.md post-fix section: status median 3ms max 4ms; cpu-ram grant 4ms; bridge-needing request with bridge down 3ms (was 607ms); idle RSS 5.4MB (was 4.7MB); DB 0.22MB at 1001 leases (was 0.65MB)"
   push_2026_11_06: "remote main b6d086a (API commit via push_files.py, --by main-chat). Local master (31 commits) and remote main shared 0 commits, so a plain git push was impossible; no force-push was used and remote history is preserved. Remote tree verified identical to local tree (git diff origin/main HEAD empty, blob-for-blob match). Local branch is master; remote branch is main. Full per-commit history lives only in the local repo."
+
+# --- Deploy, 2026-11-06 (Patch 11 + Patch 12, Phases 7-8) ---
+deploy_2026_11_06:
+  verdict: "LIVE"
+  host: "chromebook-vm (100.112.27.106), user auto"
+  deployed_commit_local: "2865080 (master)"
+  deployed_commit_remote: "16e44943 (main)"
+  tag: "v0.1.0 on 16e44943, created after the live deploy passed"
+  binaries:
+    mo_daemon: "2.8 MB, sha256 7b932dcadb427b5fae38112af5416219e9ecc9a3b62365a6e333e3cbcbdc5e51"
+    mo_cli: "855K, sha256 f5a08a1f5c4c0a10c15cbc8545cba882c473c69a65f3d7d8b45659c915340b7a"
+  build: "cargo build --release --features cli (mo-cli needs --features cli); cargo test --release 99 passed 0 failed; clippy --all-targets 0 warnings; fmt clean"
+  daemon: "active (running), PID 101776 at 17:02:29 EST, Main PID after TEST-039 restart; health daemon up, db ok, lock held"
+  schema: "v3 (v2->v3 migration ran on start; existing rows default started_desktop 0)"
+  backups: "~/.local/bin/mo-daemon.bak-20261106-1640 (sha 8fff5d1f...), ~/jobs/mo/mo.db.bak-20261106-1640 (copied while daemon ran)"
+  rollback_used: false
+  patch11_04ca0c3: "warm desktops grant without vd-start; Lease.started_desktop; schema v3; release/rollback stop only desktops MO started. Live cause: vd1-vd6 up with live CDP, vd-start exits 1 on a running desktop, so every vd-chrome grant failed E04. Tests: grant_warm_desktop_records_not_started_and_release_does_not_stop, grant_cold_desktop_records_started_and_release_stops, phase3_failure_on_warm_desktop_does_not_stop, provision_warm_desktop_returns_false_without_starting; 98 passed"
+  patch12_2865080: "single-flight drain_queue (drain_lock). Live cause: tick thread + startup drain both ran at daemon start and granted one queued vd-chrome request twice (vd1 + vd2, same second). Test: concurrent_drains_grant_once; 99 passed"
+  double_grant_cleanup: "the two stray leases (mo-1794001870-feb872 vd1, mo-1794001870-f534ec vd2) were released by hand; both had started_desktop 0 so no desktop was stopped"
+  live_lease_flows:
+    - "cpu-ram mo-1794001218-00b71a: granted 16:40:18, heartbeat ok, extend +10 min ok, released ok (pre-Patch-11 binary)"
+    - "vd-chrome mo-1794002163-6dbfee: granted 16:56:03 on warm vd1, started_desktop 0, single lease (Patch 12 holds), expired 17:01:03"
+    - "main-display mo-1794002150-b41c00: granted by mistake (test request set needs_display true), released at once. Lesson: needs_display true routes to :1; vd-chrome requests must set it false"
+    - "cpu-ram mo-1794002535-d24ee4: granted 17:02:15, survived two daemon restarts, released after TEST-039"
+  vm_tests:
+    TEST-006: "PASS: lease expired 17:01:03, leases empty at 17:02:00; vd1 cdp=live vnc=up procs=9, vd2-vd6 live"
+    TEST-029: "PASS: daemon restarted 17:02:16 EST (new PID 101712), lease mo-1794002535-d24ee4 still active, health ok"
+    TEST-039: "PASS: service restarted 17:02:29 EST (new PID 101776, enabled), health ok, lease still active"
+  dashboard:
+    file: "~/jobs/mo/dashboard.html, 2826 bytes, mtime 16:56:10 -> 16:57:10 (30 s refresh), contains MO svg and live lease id"
+    tab_on_:1: "NOT pinned: :1 showed a live WELL Health careers session with a restore-pages dialog at 16:56 EST; opening a tab would steal focus. Pin at a quiet moment."
+  github:
+    push_path: "push_files.py via gh.py.legacy SourceFileLoader, --by main-chat (plain git push impossible, 0 shared commits; no force-push)"
+    commits: "14442837 Patch 11, 16e44943 Patch 12"
+    tree_match: "yes, blob-for-blob, 26 files, verified against the API tree at 16e44943"
+    readme_collision: "remote main gained a comprehensive README (d8ffea0c) + gitdiagram badge (0f3ed2c7) from another session during the deploy window, 16:46-16:48 EST. Kept as is, synced into local README (commit c68bc94). It claims 94 tests; the count is 99 after Patch 12."
+  runbook: "implementation/runbook.md"
+  open:
+    - "dashboard tab on :1 not pinned (see above)"
+    - "TEST-010 real host reboot not run; no safe window"
+    - "TASK-020 ARM64 still blocked: no cross linker"
+    - "README test count stale (94 vs 99); fix on next README touch"
+    - "no Oracle VM exists; no Oracle adapter test has run"
