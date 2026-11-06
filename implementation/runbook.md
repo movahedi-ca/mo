@@ -80,12 +80,96 @@ A second drain waits, re-lists, and finds the request already granted.
 
 ## Dashboard
 
-File only, no server. Open file:///home/auto/jobs/mo/dashboard.html in :1 Chrome.
-Pin the tab. Never open it while :1 runs live job-application work.
-On 2026-11-06 the tab was NOT pinned: :1 showed a live WELL Health
-careers session with a restore-pages dialog. Opening a tab then would
-steal focus. Pin it at a quiet moment. The file itself refreshes every
-30 s and shows the MO character, queue, leases, desktops, battery.
+Two views of the same data. The static file `~/jobs/mo/dashboard.html`
+is rewritten by the daemon every 30 s (1960s theme since 2026-11-06
+17:35 EST: cream #F7EEDC, teal #0E7C7B, burnt orange #C65D21, brown
+#5C3A21, monospace). The live view is the native MO Dashboard app
+below, which polls the daemon socket every 3 s. The pinned-tab plan
+is superseded: the app is the display now, no browser at all.
+
+## Dashboard app (native GTK, no WebKit, no Chrome)
+
+`apps/dashboard/`, binary `~/.local/bin/mo-dashboard`, autostart
+`~/.config/autostart/mo-dashboard.desktop`. One borderless fullscreen
+window on :1. Rust, gtk 0.18 + cairo-rs 0.18 + serde + libc. The
+WebKit build (webkit2gtk 2.0.2) was replaced 2026-11-06 17:40 EST;
+the C fallback `mo-dashboard.c` was never compiled and is unused.
+
+Live data: polls `~/jobs/mo/mo.sock` with `{"cmd":"live"}` every 3 s
+(1 s timeouts). No page reload, no network port, no HTTP. Numbers
+move within seconds: verified 17:51:40 -> 17:52:13 EST (queue 2 -> 1,
+leases 1 -> 3, load 3.35 -> 2.74, RAM 3736 -> 3744 MB).
+
+Clickable desktops: every tile is a button. A tile click runs
+`~/jobs/kiosk-view.sh vdK`, which writes the VNC port to
+`~/jobs/kiosk-target` (5902 = main :1, 5902+K = vdK; vd1 = 5903,
+vd4 = 5906) and restarts `novnc-kiosk.service`. The :0 kiosk bridge
+(`~/jobs/kiosk-bridge.sh`, ExecStart of novnc-kiosk.service) reads
+that file and serves the target on 6081. View switching only: never
+stops, kills, or folds a desktop, never touches a lease. A small
+`mo-dashboard --back` window ("BACK TO MAIN", 360x100 at 780,24) sits
+on the viewed desktop; clicking it runs `kiosk-view.sh main` and
+exits. Port correction, 2026-11-06: the task brief said 5901+K; the
+real VNC ports are 5902+K (TigerVNC :1 is 5901, the kiosk bridge
+reads the :1 mirror feed on 5902). The daemon's `live` output
+confirms it (main-display vnc_port 5901 is the TigerVNC server, vdK
+is 5902+K).
+
+Display off: a manual button only, never automatic. The physical
+display is :0 (eDP-1). :1 is TigerVNC and has NO DPMS extension, so
+`DISPLAY=:1 xset dpms force off` fails ("server does not have
+extension for dpms option"); `xset s activate` also does nothing on
+:1 (the saver never blanks the VNC framebuffer). The button and
+`mo-cli display` therefore drive :0:
+
+- off: `xset -display :0 dpms 0 0 0` (zero the timers so the blank
+  can never self-trigger) then `xset -display :0 dpms force off`
+- on: `xset -display :0 dpms force on` then `xset -display :0 -dpms`
+  (restores the as-found state: DPMS disabled)
+- state (live): `xset -display :0 q`, "Monitor is Off" means off;
+  no "Monitor is" line means DPMS is disabled, which is also on
+- `mo-cli display off` / `mo-cli display on` run the same commands
+  and print the live state back as JSON
+
+Wake is by any input on :0 (mouse move or key press). Verified
+2026-11-06 18:00-18:02 EST: button press -> "Monitor is Off" +
+app label "DISPLAY: OFF" + button "DISPLAY ON"; mouse move on :0 ->
+"Monitor is On" + dashboard back; `mo-cli display on` -> DPMS
+Disabled, timers 600/600/600 (as found). Note: a screenshot never
+goes black for this route, because DPMS powers the panel while the
+framebuffer keeps its image; the proof is the xset state, not a
+black frame. The xrandr route (`--output VNC-0 --off`) DOES blank
+the framebuffer but `--auto` does NOT restore it (stays 32x32,
+"VNC-0 disconnected"); restore needs an explicit
+`--mode 1920x1080`, and the RandR change pops the Xfce Display
+settings dialog. Do not use xrandr for display off.
+
+Known app bugs, found live 2026-11-06 and fixed:
+- RefCell double borrow in the back-window reap block
+  (refresh() held one borrow_mut while taking a second) panicked
+  the app the first time a back click was reaped (17:52 EST, app
+  aborted, Chrome came forward). Fixed: check-then-clear with one
+  borrow at a time. Re-verified: back click 18:00 EST, app alive
+  12 s later, no crash.
+- GTK theme painted buttons with its own gradient, hiding the
+  1960s colors (white text on pale tiles, unreadable DISPLAY OFF
+  button). Fixed: `background-image: none` on button and desk
+  classes. The :hover rule also washed the big button to cream;
+  fixed with a darker-orange `.big-button:hover`.
+- Startup drain blocks the socket: the daemon runs
+  `drain_queue()` on the main thread BEFORE `serve()` binds the
+  socket, and the drain loop has no cap. With a non-empty queue
+  (stress session, 2026-11-06 17:46 EST) the socket stayed
+  refused for ~5 minutes (main thread in nanosleep inside the
+  grant/provision poll) while the tick thread kept working. It
+  cleared on its own when the queue drained. Fix pending: move
+  the startup drain into a background thread (or cap it). Do not
+  restart the daemon to clear this while another session holds
+  leases: a restart kills the daemon's children (vd Xvfb/openbox)
+  and breaks their leases.
+
+Kiosk scripts live in the repo at `apps/dashboard/kiosk-view.sh`
+and `apps/dashboard/kiosk-bridge.sh`, installed in `~/jobs/`.
 
 ## Battery
 
@@ -167,11 +251,13 @@ after the live deploy passes: v0.1.0 on 16e44943 (2026-11-06).
 | Grants always queued | Capacity or battery | Read mo-cli status. Check MemAvailable, load, battery. |
 | Dashboard stale | Daemon down or write fail | Check daemon status. Check the dashboard mtime. |
 | E05 battery | Low battery | Charge. Or wait. Do not lower gates silently. |
-| CLI cannot connect | Daemon down or wrong socket | Check MO_SOCKET_PATH and daemon status. |
+| CLI cannot connect | Daemon down or wrong socket | Check MO_SOCKET_PATH and daemon status. If the daemon just restarted with a non-empty queue, the startup drain can hold the socket for minutes (see Dashboard app section); wait, do not restart while another session holds leases. |
+| App shows DAEMON: DOWN after a daemon restart | Startup drain blocking serve() | Same as above. The socket returns when the queue drains. |
 
 ## Open items
 
-- Dashboard tab on :1: not pinned yet. Pin at a quiet moment.
+- Dashboard tab on :1: SUPERSEDED by the standalone app (no browser for the display). Do not pin a tab.
+- Startup drain blocks the socket (see Dashboard app section): move the startup drain_queue() into a background thread or cap it. Not fixed in this run; needs a daemon restart at a quiet moment (no live leases).
 - TEST-010 (reboot recovery on a real host reboot): not run. No safe window yet.
 - TEST-020 ARM64: blocked. No aarch64 cross linker on the build host or the VM.
 - README on remote main was rewritten by another session during deploy

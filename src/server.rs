@@ -367,6 +367,7 @@ impl Daemon {
             "status" => self.cmd_status(),
             "queue" => self.cmd_queue(),
             "leases" => self.cmd_leases(),
+            "live" => self.cmd_live(),
             "health" => self.cmd_health(),
             "fold" => self.cmd_fold(msg, now),
             "expand" => self.cmd_expand(now),
@@ -576,6 +577,29 @@ impl Daemon {
             "extension_pending",
         ])?;
         Ok(json!({ "leases": leases, "count": leases.len() }))
+    }
+
+    /// One consistent snapshot for the live dashboard app: status +
+    /// queue + leases + desktops in a single call, so the app never
+    /// renders a half-old frame. Read only. No state changes.
+    fn cmd_live(&self) -> Result<Value> {
+        let inv = crate::inventory::read_inventory();
+        let status = crate::notify::snapshot(&self.store, &inv, &self.cfg);
+        let queued = self.store.list_queued_requests()?;
+        let leases = self.store.list_leases(&[
+            "active",
+            "granted",
+            "reserving",
+            "stale",
+            "extension_pending",
+        ])?;
+        let desktops = crate::desktops::list_desktops_cached();
+        Ok(json!({
+            "status": status,
+            "queue": queued,
+            "leases": leases,
+            "desktops": desktops,
+        }))
     }
 
     fn cmd_health(&self) -> Result<Value> {

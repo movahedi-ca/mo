@@ -33,8 +33,9 @@ pub fn face_for(battery: BatteryState, active_leases: usize) -> MoFace {
     }
 }
 
-/// MO character as inline SVG. Teal #0E7C7B head, white dot eyes,
-/// one line mouth, one antenna line with one dot, M O under the face.
+/// MO character as inline SVG. Retro 1960s style: teal #0E7C7B head,
+/// burnt-orange antenna ball, white dot eyes, one line mouth,
+/// monospace M O under the face.
 pub fn mo_svg(face: MoFace) -> String {
     let (head, mouth) = match face {
         MoFace::Idle => ("#0E7C7B", "M28 56 Q40 64 52 56"),
@@ -45,12 +46,12 @@ pub fn mo_svg(face: MoFace) -> String {
     format!(
         "<svg width=\"80\" height=\"100\" viewBox=\"0 0 80 100\" role=\"img\" aria-label=\"MO\">\
         <line x1=\"40\" y1=\"4\" x2=\"40\" y2=\"16\" stroke=\"{head}\" stroke-width=\"3\"/>\
-        <circle cx=\"40\" cy=\"6\" r=\"4\" fill=\"{head}\"/>\
+        <circle cx=\"40\" cy=\"6\" r=\"4\" fill=\"#C65D21\"/>\
         <rect x=\"8\" y=\"16\" width=\"64\" height=\"56\" rx=\"12\" fill=\"{head}\"/>\
         <circle cx=\"28\" cy=\"38\" r=\"5\" fill=\"#FFFFFF\"/>\
         <circle cx=\"52\" cy=\"38\" r=\"5\" fill=\"#FFFFFF\"/>\
         <path d=\"{mouth}\" stroke=\"#FFFFFF\" stroke-width=\"3\" fill=\"none\" stroke-linecap=\"round\"/>\
-        <text x=\"40\" y=\"92\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"16\" fill=\"#333333\">M O</text>\
+        <text x=\"40\" y=\"92\" text-anchor=\"middle\" font-family=\"monospace\" font-size=\"16\" fill=\"#5C3A21\">M O</text>\
         </svg>"
     )
 }
@@ -187,7 +188,7 @@ pub fn render_data(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
         <meta http-equiv=\"refresh\" content=\"{refresh}\">\
         <title>MO - Local Resource Assistant</title>\
-        <style>body{{font-family:sans-serif;margin:24px;color:#222}}h1{{font-size:28px}}table{{border-collapse:collapse;margin:8px 0}}td,th{{border:1px solid #ccc;padding:4px 8px;text-align:left}}th{{background:#eee}}.bar{{width:200px;height:16px;border:1px solid #999}}.bar>i{{display:block;height:16px;background:#0E7C7B}}.grid{{display:flex;flex-wrap:wrap;gap:8px}}.desk{{border:1px solid #ccc;padding:8px;min-width:90px;text-align:center}}.face{{float:right;text-align:center}}</style>\
+        <style>body{{font-family:\"DejaVu Sans Mono\",\"Liberation Mono\",monospace;margin:24px;color:#5C3A21;background:#F7EEDC}}h1{{font-size:30px;letter-spacing:2px;text-transform:uppercase;color:#5C3A21;border-bottom:3px solid #C65D21;padding-bottom:8px}}h2{{font-size:20px;letter-spacing:2px;text-transform:uppercase;color:#0E7C7B}}table{{border-collapse:collapse;margin:8px 0;background:#FFF8E7}}td,th{{border:1px solid #5C3A21;padding:4px 8px;text-align:left}}th{{background:#0E7C7B;color:#FFF8E7}}.bar{{width:200px;height:16px;border:2px solid #5C3A21;border-radius:8px;background:#FFF8E7}}.bar>i{{display:block;height:16px;background:#0E7C7B;border-radius:6px}}.grid{{display:flex;flex-wrap:wrap;gap:8px}}.desk{{border:2px solid #5C3A21;border-radius:12px;padding:8px;min-width:90px;text-align:center;background:#FFF8E7}}.face{{float:right;text-align:center}}small{{color:#8A6D4B}}</style>\
         </head><body>\
         <div class=\"face\">{}<br>MO is {}</div>\
         <h1>MO - Local Resource Assistant</h1>\
@@ -289,6 +290,10 @@ mod tests {
         assert!(!html.contains("src=\"http"));
         assert!(!html.contains("fetch("));
         assert!(html.contains("#0E7C7B"));
+        // 1960s theme: warm cream page, brown text, monospace type.
+        assert!(html.contains("#F7EEDC"));
+        assert!(html.contains("monospace"));
+        assert!(html.contains("#C65D21"));
         drop(s);
         let _ = std::fs::remove_file(p);
     }
