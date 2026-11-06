@@ -7,7 +7,7 @@ use crate::core::{AuditEvent, Lease, MoError, QueuedRequest, Result};
 use rusqlite::{params, Connection, Transaction};
 use std::sync::Mutex;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -29,9 +29,12 @@ CREATE TABLE IF NOT EXISTS requests (
   needs_bridge INTEGER NOT NULL DEFAULT 0,
   needs_display INTEGER NOT NULL DEFAULT 0,
   capabilities_json TEXT NOT NULL DEFAULT '[]',
+  mem_mb_max INTEGER,
+  lease_id TEXT,
   created_unix INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'queued'
 );
+CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_idempotency
   ON requests(agent_id, idempotency_key);
 CREATE TABLE IF NOT EXISTS leases (
@@ -52,11 +55,19 @@ CREATE TABLE IF NOT EXISTS leases (
   heartbeat_due_unix INTEGER NOT NULL,
   heartbeat_misses INTEGER NOT NULL DEFAULT 0,
   extensions INTEGER NOT NULL DEFAULT 0,
+  last_heartbeat_unix INTEGER NOT NULL DEFAULT 0,
   created_unix INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_desktop_active
   ON leases(desktop)
-  WHERE state IN ('reserving','granted','active','stale','extension_pending');
+  WHERE state IN ('reserving','granted','active','stale','extension_pending','interrupted')
+  AND desktop != 'none';
+CREATE INDEX IF NOT EXISTS idx_leases_state ON leases(state);
+CREATE TABLE IF NOT EXISTS flagged_desktops (
+  desktop TEXT PRIMARY KEY,
+  reason TEXT NOT NULL,
+  flagged_unix INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS reservations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   lease_id TEXT NOT NULL REFERENCES leases(lease_id),
@@ -81,6 +92,8 @@ CREATE TABLE IF NOT EXISTS audit (
   detail TEXT NOT NULL,
   created_unix INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_audit_created ON audit(created_unix);
+CREATE INDEX IF NOT EXISTS idx_hb ON heartbeats(lease_id, beat_unix DESC);
 CREATE TABLE IF NOT EXISTS inventory_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   taken_unix INTEGER NOT NULL,
@@ -94,10 +107,81 @@ CREATE TABLE IF NOT EXISTS inventory_snapshots (
   battery_pct INTEGER,
   battery_state TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_snapshots_taken ON inventory_snapshots(taken_unix);
 ";
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+/// Migrate a v1 database to v2. Idempotent: every step checks first.
+fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+    let has_col = |table: &str, col: &str| -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == col {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if !has_col("leases", "last_heartbeat_unix")? {
+        conn.execute(
+            "ALTER TABLE leases ADD COLUMN last_heartbeat_unix INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_col("requests", "mem_mb_max")? {
+        conn.execute("ALTER TABLE requests ADD COLUMN mem_mb_max INTEGER", [])?;
+    }
+    if !has_col("requests", "lease_id")? {
+        conn.execute("ALTER TABLE requests ADD COLUMN lease_id TEXT", [])?;
+    }
+    conn.execute(
+        "UPDATE leases SET last_heartbeat_unix =
+         COALESCE((SELECT MAX(beat_unix) FROM heartbeats
+                   WHERE heartbeats.lease_id = leases.lease_id), start_unix)",
+        [],
+    )?;
+    conn.execute("DROP INDEX IF EXISTS idx_leases_desktop_active", [])?;
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_leases_desktop_active ON leases(desktop)
+         WHERE state IN ('reserving','granted','active','stale','extension_pending','interrupted')
+         AND desktop != 'none'",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status, id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_leases_state ON leases(state)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_created ON audit(created_unix)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hb ON heartbeats(lease_id, beat_unix DESC)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_snapshots_taken ON inventory_snapshots(taken_unix)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS flagged_desktops (
+         desktop TEXT PRIMARY KEY, reason TEXT NOT NULL, flagged_unix INTEGER NOT NULL)",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE schema_meta SET value='2' WHERE key='schema_version'",
+        [],
+    )?;
+    Ok(())
 }
 
 impl Store {
@@ -108,6 +192,9 @@ impl Store {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "cache_size", -8000)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "mmap_size", 67108864)?;
         conn.execute_batch(SCHEMA)?;
         let version: Option<String> = conn
             .query_row(
@@ -132,11 +219,190 @@ impl Store {
                         "DB schema version {n} is newer than binary {SCHEMA_VERSION}"
                     )));
                 }
+                if n == 1 {
+                    migrate_v1_to_v2(&conn)?;
+                }
             }
         }
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Set the granted lease id on a request row. Lets cmd_request return
+    /// the exact lease instead of guessing by agent_id + job_id.
+    pub fn set_request_lease(&self, id: i64, lease_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        conn.execute(
+            "UPDATE requests SET lease_id=?1 WHERE id=?2",
+            params![lease_id, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_request(&self, id: i64) -> Result<Option<QueuedRequest>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, job_id, idempotency_key, resource_class, cpu_cores,
+             mem_mb, desktops, duration_min, priority_class, deadline, needs_bridge,
+             needs_display, mem_mb_max, lease_id, capabilities_json, created_unix, status
+             FROM requests WHERE id=?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_request(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Latest audit row for one agent + job, newest first. Used to report
+    /// the real denial reason instead of a generic E04.
+    pub fn last_audit_for(&self, agent_id: &str, job_id: &str) -> Result<Option<AuditEvent>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, event, agent_id, job_id, lease_id, desktop, detail, created_unix
+             FROM audit WHERE agent_id=?1 AND job_id=?2 ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![agent_id, job_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(AuditEvent {
+                id: row.get(0)?,
+                event: row.get(1)?,
+                agent_id: row.get(2)?,
+                job_id: row.get(3)?,
+                lease_id: row.get(4)?,
+                desktop: row.get(5)?,
+                detail: row.get(6)?,
+                created_unix: row.get(7)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Latest audit row for one event + desktop since `since_unix`, if any.
+    /// Used to coalesce repeated bypass / skip audits.
+    pub fn last_audit_event(
+        &self,
+        event: &str,
+        desktop: &str,
+        since_unix: i64,
+    ) -> Result<Option<AuditEvent>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, event, agent_id, job_id, lease_id, desktop, detail, created_unix
+             FROM audit WHERE event=?1 AND desktop=?2 AND created_unix>=?3
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![event, desktop, since_unix])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(AuditEvent {
+                id: row.get(0)?,
+                event: row.get(1)?,
+                agent_id: row.get(2)?,
+                job_id: row.get(3)?,
+                lease_id: row.get(4)?,
+                desktop: row.get(5)?,
+                detail: row.get(6)?,
+                created_unix: row.get(7)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Retention: snapshots older than 24h, skip audits older than a day,
+    /// heartbeats except the latest per lease, reservations whose lease is
+    /// terminal. Returns (snapshots, audits, heartbeats, reservations) deleted.
+    pub fn prune(&self, now: i64) -> Result<(i64, i64, i64, i64)> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        let snaps = conn.execute(
+            "DELETE FROM inventory_snapshots WHERE taken_unix < ?1",
+            params![now - 86400],
+        )?;
+        let audits = conn.execute(
+            "DELETE FROM audit WHERE event='skip' AND created_unix < ?1",
+            params![now - 86400],
+        )?;
+        let beats = conn.execute(
+            "DELETE FROM heartbeats WHERE id NOT IN
+             (SELECT MAX(id) FROM heartbeats GROUP BY lease_id)",
+            [],
+        )?;
+        let res = conn.execute(
+            "DELETE FROM reservations WHERE lease_id IN
+             (SELECT lease_id FROM leases
+              WHERE state IN ('released','expired','failed','denied','cancelled'))",
+            [],
+        )?;
+        Ok((snaps as i64, audits as i64, beats as i64, res as i64))
+    }
+
+    /// Flag a desktop whose stop failed. Fold refuses flagged desktops.
+    pub fn flag_desktop(&self, desktop: &str, reason: &str, now: i64) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        conn.execute(
+            "INSERT INTO flagged_desktops(desktop, reason, flagged_unix)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(desktop) DO UPDATE SET reason=excluded.reason,
+             flagged_unix=excluded.flagged_unix",
+            params![desktop, reason, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_flagged(&self, desktop: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM flagged_desktops WHERE desktop=?1",
+            params![desktop],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn clear_flag(&self, desktop: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        let n = conn.execute(
+            "DELETE FROM flagged_desktops WHERE desktop=?1",
+            params![desktop],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Checkpoint the WAL, truncating it. Run daily from the tick.
+    pub fn checkpoint(&self) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+        Ok(())
     }
 
     /// Run `f` inside one transaction. Commit or roll back as one unit.
@@ -206,8 +472,9 @@ impl Store {
         conn.execute(
             "INSERT INTO requests(agent_id, job_id, idempotency_key, resource_class,
              cpu_cores, mem_mb, desktops, duration_min, priority_class, deadline,
-             needs_bridge, needs_display, capabilities_json, created_unix, status)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             needs_bridge, needs_display, capabilities_json, mem_mb_max, lease_id,
+             created_unix, status)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, ?15, ?16)",
             params![
                 req.agent_id,
                 req.job_id,
@@ -221,7 +488,9 @@ impl Store {
                 req.deadline,
                 req.needs_bridge as i64,
                 req.needs_display as i64,
-                "[]",
+                serde_json::to_string(&req.capabilities)
+                    .map_err(|e| MoError::e10(format!("capabilities encode failed: {e}")))?,
+                req.mem_mb_max,
                 req.created_unix,
                 req.status,
             ],
@@ -241,8 +510,8 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, agent_id, job_id, idempotency_key, resource_class, cpu_cores,
              mem_mb, desktops, duration_min, priority_class, deadline, needs_bridge,
-             needs_display, created_unix, status FROM requests
-             WHERE agent_id=?1 AND idempotency_key=?2",
+             needs_display, mem_mb_max, lease_id, capabilities_json, created_unix, status
+             FROM requests WHERE agent_id=?1 AND idempotency_key=?2",
         )?;
         let mut rows = stmt.query(params![agent_id, key])?;
         if let Some(row) = rows.next()? {
@@ -260,8 +529,8 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, agent_id, job_id, idempotency_key, resource_class, cpu_cores,
              mem_mb, desktops, duration_min, priority_class, deadline, needs_bridge,
-             needs_display, created_unix, status FROM requests
-             WHERE status='queued' ORDER BY id ASC",
+             needs_display, mem_mb_max, lease_id, capabilities_json, created_unix, status
+             FROM requests WHERE status='queued' ORDER BY id ASC",
         )?;
         let rows = stmt.query_map([], row_to_request)?;
         let mut out = Vec::new();
@@ -287,8 +556,9 @@ impl Store {
         tx.execute(
             "INSERT INTO leases(lease_id, agent_id, job_id, resource_class, desktop, display,
              cdp_port, vnc_port, profile, cpu_cores, mem_mb, state, start_unix, end_unix,
-             heartbeat_due_unix, heartbeat_misses, extensions, created_unix)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             heartbeat_due_unix, heartbeat_misses, extensions, last_heartbeat_unix,
+             created_unix)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 lease.lease_id,
                 lease.agent_id,
@@ -307,6 +577,7 @@ impl Store {
                 lease.heartbeat_due_unix,
                 lease.heartbeat_misses,
                 lease.extensions,
+                lease.last_heartbeat_unix,
                 lease.created_unix,
             ],
         )?;
@@ -321,8 +592,8 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT lease_id, agent_id, job_id, resource_class, desktop, display,
              cdp_port, vnc_port, profile, cpu_cores, mem_mb, state, start_unix, end_unix,
-             heartbeat_due_unix, heartbeat_misses, extensions, created_unix
-             FROM leases WHERE lease_id=?1",
+             heartbeat_due_unix, heartbeat_misses, extensions, last_heartbeat_unix,
+             created_unix FROM leases WHERE lease_id=?1",
         )?;
         let mut rows = stmt.query(params![lease_id])?;
         if let Some(row) = rows.next()? {
@@ -346,7 +617,8 @@ impl Store {
         let sql = format!(
             "SELECT lease_id, agent_id, job_id, resource_class, desktop, display,
              cdp_port, vnc_port, profile, cpu_cores, mem_mb, state, start_unix, end_unix,
-             heartbeat_due_unix, heartbeat_misses, extensions, created_unix
+             heartbeat_due_unix, heartbeat_misses, extensions, last_heartbeat_unix,
+             created_unix
              FROM leases WHERE state IN ({placeholders}) ORDER BY created_unix ASC"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -373,13 +645,15 @@ impl Store {
     pub fn update_lease_tx(tx: &Transaction<'_>, lease: &Lease) -> Result<()> {
         tx.execute(
             "UPDATE leases SET state=?1, end_unix=?2, heartbeat_due_unix=?3,
-             heartbeat_misses=?4, extensions=?5 WHERE lease_id=?6",
+             heartbeat_misses=?4, extensions=?5, last_heartbeat_unix=?6
+             WHERE lease_id=?7",
             params![
                 lease.state,
                 lease.end_unix,
                 lease.heartbeat_due_unix,
                 lease.heartbeat_misses,
                 lease.extensions,
+                lease.last_heartbeat_unix,
                 lease.lease_id,
             ],
         )?;
@@ -411,33 +685,9 @@ impl Store {
         Ok(())
     }
 
-    pub fn insert_heartbeat(&self, lease_id: &str, beat_unix: i64) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| MoError::e10("store lock poisoned"))?;
-        conn.execute(
-            "INSERT INTO heartbeats(lease_id, beat_unix) VALUES(?1, ?2)",
-            params![lease_id, beat_unix],
-        )?;
-        Ok(())
-    }
-
-    pub fn last_heartbeat(&self, lease_id: &str) -> Result<Option<i64>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| MoError::e10("store lock poisoned"))?;
-        let v: Option<i64> = conn
-            .query_row(
-                "SELECT MAX(beat_unix) FROM heartbeats WHERE lease_id=?1",
-                params![lease_id],
-                |r| r.get(0),
-            )
-            .ok()
-            .flatten();
-        Ok(v)
-    }
+    // NOTE: the heartbeats table is kept for history and for the v1
+    // migration backfill, but nothing writes it on the hot path any
+    // more. The last beat rides on leases.last_heartbeat_unix (F14).
 
     pub fn list_audit(&self, limit: i64) -> Result<Vec<AuditEvent>> {
         let conn = self
@@ -496,14 +746,16 @@ impl Store {
         Ok(())
     }
 
-    /// Backup via VACUUM INTO.
+    /// Backup via the rusqlite backup API. The path never enters SQL text,
+    /// so a quote in the path cannot change the statement.
     pub fn backup(&self, dst: &str) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| MoError::e10("store lock poisoned"))?;
-        let sql = format!("VACUUM INTO '{dst}'");
-        conn.execute_batch(&sql)?;
+        let mut dst_conn = Connection::open(dst)?;
+        let backup = rusqlite::backup::Backup::new(&conn, &mut dst_conn)?;
+        backup.run_to_completion(100, std::time::Duration::from_millis(0), None)?;
         Ok(())
     }
 
@@ -525,12 +777,12 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT COALESCE(SUM(r.cpu_cores),0), COALESCE(SUM(r.mem_mb),0) FROM reservations r
              JOIN leases l ON l.lease_id = r.lease_id
-             WHERE l.state IN ('reserving','granted','active','stale','extension_pending')",
+             WHERE l.state IN ('reserving','granted','active','stale','extension_pending','interrupted')",
         )?;
         let (cpu, mem): (i64, i64) = stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let mut stmt2 = conn.prepare(
             "SELECT DISTINCT desktop FROM leases
-             WHERE state IN ('reserving','granted','active','stale','extension_pending')",
+             WHERE state IN ('reserving','granted','active','stale','extension_pending','interrupted')",
         )?;
         let rows = stmt2.query_map([], |r| r.get::<_, String>(0))?;
         let mut desktops = Vec::new();
@@ -538,6 +790,23 @@ impl Store {
             desktops.push(r?);
         }
         Ok((cpu, mem, desktops))
+    }
+
+    /// CPU/RAM held by leases still in "reserving": they have not
+    /// consumed the RAM yet, so only these are subtracted from
+    /// MemAvailable. Active leases already moved MemAvailable down.
+    pub fn reserving_totals(&self) -> Result<(i64, i64)> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        let (cpu, mem): (i64, i64) = conn.query_row(
+            "SELECT COALESCE(SUM(cpu_cores),0), COALESCE(SUM(mem_mb),0)
+             FROM leases WHERE state='reserving'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((cpu, mem))
     }
 
     /// Set a schema_meta key. Used by recovery to record the boot id.
@@ -632,8 +901,12 @@ pub fn recover_on_start(store: &Store, now: i64, reboot: bool) -> Result<Recover
         let id = lease.lease_id.clone();
         let desktop = lease.desktop.clone();
         if reboot {
+            // Anchor the 10-minute revive window at the interruption time.
+            let mut lc = lease.clone();
+            lc.state = "interrupted".to_string();
+            lc.last_heartbeat_unix = now;
             store.with_tx(|tx| {
-                Store::update_lease_state_tx(tx, &id, "interrupted")?;
+                Store::update_lease_tx(tx, &lc)?;
                 Store::audit_tx(
                     tx,
                     "recovery_interrupted",
@@ -697,8 +970,11 @@ pub fn recover_on_start(store: &Store, now: i64, reboot: bool) -> Result<Recover
         for lease in active {
             let id = lease.lease_id.clone();
             let desktop = lease.desktop.clone();
+            let mut lc = lease.clone();
+            lc.state = "interrupted".to_string();
+            lc.last_heartbeat_unix = now;
             store.with_tx(|tx| {
-                Store::update_lease_state_tx(tx, &id, "interrupted")?;
+                Store::update_lease_tx(tx, &lc)?;
                 Store::audit_tx(
                     tx,
                     "recovery_interrupted",
@@ -745,8 +1021,14 @@ fn row_to_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedRequest> {
         deadline: row.get(10)?,
         needs_bridge: row.get::<_, i64>(11)? != 0,
         needs_display: row.get::<_, i64>(12)? != 0,
-        created_unix: row.get(13)?,
-        status: row.get(14)?,
+        mem_mb_max: row.get(13)?,
+        lease_id: row.get(14)?,
+        capabilities: {
+            let caps_json: String = row.get(15)?;
+            serde_json::from_str(&caps_json).unwrap_or_default()
+        },
+        created_unix: row.get(16)?,
+        status: row.get(17)?,
     })
 }
 
@@ -769,7 +1051,8 @@ fn row_to_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
         heartbeat_due_unix: row.get(14)?,
         heartbeat_misses: row.get(15)?,
         extensions: row.get(16)?,
-        created_unix: row.get(17)?,
+        last_heartbeat_unix: row.get(17)?,
+        created_unix: row.get(18)?,
     })
 }
 
@@ -801,6 +1084,9 @@ mod tests {
             deadline: None,
             needs_bridge: false,
             needs_display: false,
+            mem_mb_max: None,
+            lease_id: None,
+            capabilities: vec![],
             created_unix: now_unix(),
             status: "queued".to_string(),
         }
@@ -826,8 +1112,80 @@ mod tests {
             heartbeat_due_unix: now + 300,
             heartbeat_misses: 0,
             extensions: 0,
+            last_heartbeat_unix: 0,
             created_unix: now,
         }
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_opens_old_db_and_fixes_index() {
+        let path = tmp_path();
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO schema_meta VALUES('schema_version','1');
+                 CREATE TABLE requests(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   agent_id TEXT, job_id TEXT, idempotency_key TEXT, resource_class TEXT,
+                   cpu_cores INTEGER, mem_mb INTEGER, desktops INTEGER, duration_min INTEGER,
+                   priority_class TEXT, deadline TEXT, needs_bridge INTEGER, needs_display INTEGER,
+                   capabilities_json TEXT NOT NULL DEFAULT '[]', created_unix INTEGER,
+                   status TEXT NOT NULL DEFAULT 'queued');
+                 CREATE TABLE leases(lease_id TEXT PRIMARY KEY, agent_id TEXT, job_id TEXT,
+                   resource_class TEXT, desktop TEXT, display TEXT, cdp_port INTEGER,
+                   vnc_port INTEGER, profile TEXT, cpu_cores INTEGER, mem_mb INTEGER,
+                   state TEXT, start_unix INTEGER, end_unix INTEGER, heartbeat_due_unix INTEGER,
+                   heartbeat_misses INTEGER, extensions INTEGER, created_unix INTEGER);
+                 CREATE UNIQUE INDEX idx_leases_desktop_active ON leases(desktop)
+                   WHERE state IN ('reserving','granted','active','stale','extension_pending');
+                 CREATE TABLE heartbeats(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   lease_id TEXT, beat_unix INTEGER);
+                 CREATE TABLE audit(id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT,
+                   agent_id TEXT, job_id TEXT, lease_id TEXT, desktop TEXT, detail TEXT,
+                   created_unix INTEGER);
+                 CREATE TABLE reservations(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   lease_id TEXT, desktop TEXT, cpu_cores INTEGER, mem_mb INTEGER,
+                   bridge_slot INTEGER, created_unix INTEGER);
+                 CREATE TABLE inventory_snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   taken_unix INTEGER, mem_available_mb INTEGER, mem_total_mb INTEGER,
+                   load1 REAL, disk_free_gb REAL, chrome_count INTEGER, desktops_up INTEGER,
+                   bridge_pool_free INTEGER, bridge_known INTEGER, battery_pct INTEGER,
+                   battery_state TEXT);
+                 INSERT INTO leases VALUES('mo-old-1','a','j','cpu-ram','none',':1',NULL,
+                   NULL,NULL,1,256,'active',1000,2800,1300,0,0,1000);
+                 INSERT INTO heartbeats(lease_id, beat_unix) VALUES('mo-old-1',1200);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let c = Connection::open(&path).unwrap();
+        let v: String = c
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, "2");
+        let old = s.get_lease("mo-old-1").unwrap().unwrap();
+        assert_eq!(old.last_heartbeat_unix, 1200);
+        // DEFECT-001: two cpu-ram leases (desktop 'none') must coexist now.
+        let now = now_unix();
+        for id in ["mo-new-1", "mo-new-2"] {
+            let l = sample_lease(id, "none", "active");
+            let _ = now;
+            s.with_tx(|tx| {
+                Store::insert_lease_tx(tx, &l)?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        // Flagged-desktops table exists.
+        s.flag_desktop("vd1", "stop failed", now_unix()).unwrap();
+        assert!(s.is_flagged("vd1").unwrap());
+        assert!(s.clear_flag("vd1").unwrap());
+        drop(s);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

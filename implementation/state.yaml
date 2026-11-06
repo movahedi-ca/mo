@@ -16,6 +16,9 @@ tasks:
   TASK-012: { status: completed_verified, evidence: "cargo test 60 passed" }
   TASK-013: { status: completed_verified, evidence: "cargo test 61 passed, socket round trip live" }
   TASK-019: { status: completed_verified, evidence: "cargo test 65 passed" }
+  TASK-015: { status: completed_verified, evidence: "implementation/benchmarks.md: status median 2ms max 8ms; grant median 607ms max 612ms (bridge down) / 9ms (bridge up); idle RSS 4.7MB max, CPU 0.002% over 12.5min; DB 0.65MB at 1000 leases; dashboard 30s refresh, max interval 31s; socket 600; 0 TCP listeners" }
+  TASK-016: { status: completed_verified, evidence: "implementation/test-evidence.md: TEST-001..042: 36 PASS, 2 FAIL (TEST-038 bypass, TEST-041 stop-fail), 4 COULD-NOT-RUN (TEST-006, TEST-010, TEST-029, TEST-039 need chromebook-vm / cross linker). 28 scenarios: 21 PASS, 2 FAIL, 4 COULD-NOT-RUN, 1 GAP (no CPU-load gate). Defects DEFECT-001..005 recorded" }
+  TASK-020: { status: blocked, evidence: "aarch64 target installed here but no aarch64-linux-gnu-gcc: cargo check fails cc-rs ToolNotFound (os error 2). chromebook-vm: rustc 1.99.1, target NOT installed, no cross gcc. Unblock: install gcc-aarch64-linux-gnu on the build host (+ rustup target add on the VM)" }
 
 toolchain: rustc 1.99.1, installed locally via rustup stable (this host had no rustc)
 deps: rusqlite 0.32, serde 1, serde_json 1, clap 4, uuid 1 (five runtime deps, Cargo.lock pinned)
@@ -28,9 +31,102 @@ deviations:
     `cargo check --target aarch64-unknown-linux-gnu` fails in libsqlite3-sys
     build script (ToolNotFound). Not a code issue. TASK-020 owner to verify
     where a cross compiler exists.
+  - TASK-015/016 test deviations (2026-11-06, tester): benchmarks and
+    adversarial tests ran on this dev VM, not chromebook-vm, with fake
+    fixtures in private mount namespaces (fake BAT0 78%, fake meminfo
+    6000 MB + fake cpuinfo 16 cores for multi-lease tests, fake vd
+    scripts opening TCP listeners on CDP ports, fake bridge responder).
+    Guards set to 0 by env (host MemAvailable 635-760 MB is below the
+    1200 MB default guard). No MO code was changed for the tests.
+  - TEST-024 deviation: bridge-down requests stay queued, not denied.
+    No partial grant. E04 appears in the response.
+  - TEST-037 observation: inventory reads the battery sensor directly,
+    never through the HostAdapter, so Oracle has_battery=false is not
+    consulted by the battery gate.
+
+defects:
+  - DEFECT-001 (major): unique index on desktop covers "none", so only
+    one cpu-ram lease can be active at a time. Second cpu-ram request
+    is denied. Evidence in implementation/test-evidence.md.
+  - DEFECT-002 (major): release never stops the desktop. A released vd
+    keeps its CDP listener up. Fold then refuses it (E13, CDP responds).
+  - DEFECT-003 (major): no bypass detection. A desktop started without
+    a lease produces zero audit events (TEST-038 FAIL).
+  - DEFECT-004 (minor): failed vd-stop writes no audit row and flags
+    nothing (TEST-041 FAIL). Error E04 surfaces, nothing is recorded.
+  - DEFECT-005 (minor): systemd unit puts StartLimitBurst and
+    StartLimitIntervalSec under [Service]; both are [Unit] keys and
+    are ignored. Restart rate limiting is inactive.
+
+observations:
+  - Grant takes ~607 ms with the bridge down (3x200 ms retry sleeps)
+    and ~9 ms with the bridge up. Target still passes.
+  - CLI responses mask real denial reasons (E05/E06/E07) as generic
+    queued/E04 while the request row is marked denied.
+  - No startup drain: a queued request surviving a crash waits for
+    the next request to arrive (TEST-022).
+  - No CLI cancel command although queue::cancel exists.
+  - No CPU-load admission gate exists; load is only observed.
+  - Disk guard measures df "/" free space, not the DB filesystem.
+
+notes:
 
 notes:
   - No deploy done. No remote configured. No push made.
   - Daemon smoke tested live on this host (debug build, /tmp paths):
     request -> granted, status, heartbeat, extend, release, health all JSON OK.
   - Socket round trip test covers request to release over a live Unix socket.
+
+# --- Architecture-review fix run, 2026-11-06 (patches 0-10 + sweep) ---
+fix_run_2026_11_06:
+  validation: "implementation/review-validation.md: F01-F16 all CONFIRMED (0 REJECTED), both footguns CONFIRMED, systemd note CONFIRMED, test notes CONFIRMED"
+  commits:
+    patch0_e07588b: "schema v2 migration, DEFECT-001 index fix (desktop 'none' excluded from unique index), flagged desktops, rusqlite backup API (footgun 2), indexes, PRAGMAs; test migrate_v1_to_v2_opens_old_db_and_fixes_index; 66 passed"
+    patch1_bf1d160: "wait vs deny in drain_queue (F01), battery skip except Refuse (F02), skip-audit coalescing, queued reply carries real reason (OBS-001), lease_id on request row; tests transient_grant_failure_stays_queued, battery_warn_skips_vd_but_grants_cpu_ram, skip_audits_coalesce_within_a_minute, duplicate_replay_returns_grant; 70 passed"
+    patch2_22bb9ac: "phase-3 rollback + sqlite error mapping (F04), release stops desktop (DEFECT-002), stop failure audits + flags desktop (DEFECT-004); tests phase3_failure_rolls_back, release_stops_desktop_and_flags_on_stop_failure, sqlite_error_codes_map, fold_refuses_flagged_desktop; 75 passed"
+    patch3_4e021a7: "scheduler tick every 10s + drain after release (F05), interrupted revive rules + 10-min expiry (F08), bypass audit (DEFECT-003), mo-cli cancel + clear-flag (OBS-006), retention prune + WAL checkpoint; tests tick_expires_stale_requests, tick_audits_bypass_desktop, cancel_and_clear_flag_commands, interrupted_heartbeat_revive_rules, expire_interrupted_after_window; 79 passed"
+    patch4_675339c: "single-flight snapshot, lazy bridge one-try + negative cache, statvfs disk (F03/F13, OBS-002, OBS-008), comm-first Chrome census, battery takes &Config; tests fresh_mem_matches_probe, grant_with_bridge_down_is_fast; 81 passed"
+    patch5_5a45fa7: "thread-per-connection, 2s read timeout, 64 KiB line cap (F03, footgun 1), CLI missing-file maps to E01; tests slow_client_does_not_block_daemon, oversized_line_is_rejected; 81 passed"
+    patch6_acab1df: "budget fix: no double RAM subtraction, CPU gated on load1, ncpu cached at start, desktops min(config, adapter) (F06, F11, F12); tests free_capacity_budget, pick_desktop_prefers_warm_and_gates_cold; 85 passed"
+    patch7_b5acfcc: "desktops 0/1 only (F07), true extend conflict (F09), expand/provision battery gate, chrome_budget_mb config (F11), expand E02 without desktops, battery gate skipped when adapter has no battery (OBS-004); tests desktops_two_is_rejected, extend_allows_when_queued_request_fits_anyway, extend_denies_when_queued_request_needs_this_desktop, expand_on_oracle_is_e02, provision_blocked_at_battery_warn; 90 passed"
+    patch8_5cb71ac: "one-transaction heartbeat on leases.last_heartbeat_unix, heartbeats table off hot path, reservations deleted on expire (F14); synchronous stays FULL (measured 0.03ms FULL vs 0.02ms NORMAL); tests heartbeat_updates_last_beat_and_sweep_uses_it, expire_leases_deletes_reservations; 92 passed"
+    patch9_4d58dcb: "score-first aging, derived Ord removed from PriorityClass (F10), dashboard gather-once + tmp/rename + config interval + host local time + monotonic now_unix (F15); tests aging_promotes_p2_over_fresh_p1_in_order, now_never_goes_backwards; test-stability: grant tests use fixed healthy inventory snapshot under shared lock after 8 flaked on live load1; 93 passed"
+    patch10_bcb26ad: "release profile opt-level 3 thin LTO codegen-units 1 strip (panic stays unwind), rust-version 1.89, Cargo.lock committed, clap feature-gated (mo-cli needs --features cli; per-bin mo-daemon build has 0 clap strings), systemd StartLimit keys to [Unit] + After=default.target (DEFECT-005), IO mapped at call sites (F16)"
+    sweep_fa7a7cf: "proactive sweep (j): profile root and jobs dir derive from $HOME (MO_PROFILE_ROOT, MO_JOBS_DIR); test profile_root_honors_env; 94 passed"
+  defects:
+    DEFECT-001: "FIXED patch 0: unique index excludes desktop 'none'"
+    DEFECT-002: "FIXED patch 2: release stops the desktop it held"
+    DEFECT-003: "FIXED patch 3: tick audits bypass desktops once per desktop per hour"
+    DEFECT-004: "FIXED patch 2: stop failure audits stop_failed and flags the desktop; fold refuses flagged"
+    DEFECT-005: "FIXED patch 10: StartLimit keys moved to [Unit]; systemd-analyze verify clean of StartLimit warnings"
+  observations_closed:
+    OBS-001: "FIXED patch 1: queued reply carries the real reason from the latest audit row"
+    OBS-002: "FIXED patch 4: bridge probed once only when a queued row needs it; bridge-down grant path 607ms -> 3ms"
+    OBS-003: "FIXED patch 3: tick drains at startup and every 10s"
+    OBS-004: "FIXED patches 4+7: battery classifier takes &Config; gate skipped when adapter reports no battery"
+    OBS-005: "FIXED patch 1: skip audits coalesce by reason kind once per minute"
+    OBS-006: "FIXED patch 3: mo-cli cancel and clear-flag commands added"
+    OBS-007: "FIXED patch 3: reclaim has an explicit CDP-alive + Chrome-dead branch"
+    OBS-008: "FIXED patch 4: disk free from statvfs on the DB filesystem"
+    OBS-009: "unchanged by design: status battery can lag the grant gate by up to the 60s cache"
+    OBS-010: "FIXED patch 6: CPU is now enforced, free cores = ncpu - ceil(load1) floored at 0"
+  proactive_sweep:
+    a_config_values: "CONFIRMED+FIXED: lease_default_min deleted (patch 0); inventory_cache_sec honored (patch 4); max_vd/sustained_vd honored (patch 6); chrome budget is a config field (patch 7)"
+    b_tables: "CONFIRMED+FIXED: indexes on requests(status,id), leases(state), audit(created_unix), heartbeats(lease_id,beat_unix DESC), inventory_snapshots(taken_unix) (patch 0); retention prune daily (patch 3)"
+    c_sql_strings: "CONFIRMED+FIXED: VACUUM INTO replaced by rusqlite backup API (patch 0); list_leases IN placeholders reviewed, bound params only"
+    d_unbounded: "CONFIRMED+FIXED: bridge body capped 64 KiB (patch 4); read_line capped 64 KiB + 2s timeout (patch 5); no unbounded retry loops found"
+    e_ord: "CONFIRMED+FIXED: PriorityClass derived Ord removed (patch 9); no other derived Ord is trusted by the scheduler or state machine (grep verified)"
+    f_wall_clock: "CONFIRMED+FIXED: now_unix boot-anchored monotonic (patch 9); all fixed -5/EST labels replaced by host local time (patch 9)"
+    g_error_mapping: "CONFIRMED+FIXED: sqlite errors mapped by code (patch 2); CLI IO mapped (patch 5); daemon startup IO mapped at call site (patch 10); blanket From<io::Error> kept for ? ergonomics, recorded in ADR-001"
+    h_dropped_fields: "CONFIRMED+FIXED: capabilities_json + mem_mb_max stored (patch 0); Extended/ExtensionPending states recorded not changed (ADR-001)"
+    i_lease_pick: "CONFIRMED+FIXED: cmd_request finds the lease by request.lease_id; replay returns the grant (patches 0-1); no other agent_id+job_id lease pick found (grep verified)"
+    j_host_paths: "CONFIRMED+FIXED: profile root + jobs dir derive from $HOME with env overrides (sweep fa7a7cf); CDP/VNC numbering is the documented vdK convention, adapter-gated (ADR-001)"
+  judgments: "ADR-001 (implementation/adr-001-fix-run.md): (a) synchronous FULL kept, measured 0.03ms vs 0.02ms NORMAL; (b) async provision deferred, safe subset shipped; (c) panic=abort rejected, unwind kept"
+  v3_1_flags: "implementation/adr-001-fix-run.md lists the V3 design decisions changed; playbook needs a V3.1 amendment"
+  follow_ups:
+    - "async provision (reserve, return, worker provisions) — patch 5 safe subset only"
+    - "TASK-020 ARM64 still blocked: no cross linker"
+    - "TEST-006/029/039 could-not-run need chromebook-vm (live Chrome, reboot, systemd after reboot)"
+    - "deploy run: deployment NOT done in this run"
+  final_gate: "cargo test --release: 94 passed, 0 failed (lib); cargo clippy --release --all-targets: 0 warnings; cargo fmt --check: clean"
+  benchmarks_after: "implementation/benchmarks.md post-fix section: status median 3ms max 4ms; cpu-ram grant 4ms; bridge-needing request with bridge down 3ms (was 607ms); idle RSS 5.4MB (was 4.7MB); DB 0.22MB at 1001 leases (was 0.65MB)"

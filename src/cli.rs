@@ -1,7 +1,7 @@
 //! mo-cli commands. JSON in, JSON out. CLI never writes state directly.
 //! Every command goes through the Unix socket to mo-daemon.
 
-use crate::core::{LeaseRequest, Result};
+use crate::core::{LeaseRequest, MoError, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
@@ -52,6 +52,21 @@ enum Cmd {
     },
     /// Expand one desktop when the queue rule allows it.
     Expand,
+    /// Cancel a queued request by agent + idempotency key.
+    Cancel {
+        /// Agent id that submitted the request.
+        #[arg(long)]
+        agent: String,
+        /// Idempotency key of the request.
+        #[arg(long)]
+        key: String,
+    },
+    /// Clear a flagged desktop so fold can run on it again.
+    ClearFlag {
+        /// Desktop id, for example vd1.
+        #[arg(long)]
+        desktop: String,
+    },
 }
 
 /// CLI entry.
@@ -60,7 +75,8 @@ pub fn run() -> Result<()> {
     let socket = crate::server::default_socket_path();
     let msg = match &cli.cmd {
         Cmd::Request { file } => {
-            let text = std::fs::read_to_string(file)?;
+            let text = std::fs::read_to_string(file)
+                .map_err(|e| MoError::e01(format!("cannot read request file {file}: {e}")))?;
             let req: LeaseRequest = serde_json::from_str(&text)?;
             json!({ "cmd": "request", "request": req })
         }
@@ -75,6 +91,12 @@ pub fn run() -> Result<()> {
         Cmd::Health => json!({ "cmd": "health" }),
         Cmd::Fold { desktop } => json!({ "cmd": "fold", "desktop": desktop }),
         Cmd::Expand => json!({ "cmd": "expand" }),
+        Cmd::Cancel { agent, key } => json!({
+            "cmd": "cancel",
+            "agent_id": agent,
+            "idempotency_key": key
+        }),
+        Cmd::ClearFlag { desktop } => json!({ "cmd": "clear-flag", "desktop": desktop }),
     };
     let resp = crate::server::call(&socket, &msg)?;
     println!("{}", serde_json::to_string_pretty(&resp)?);

@@ -65,12 +65,15 @@ pub fn fits(req: &QueuedRequest, free: &FreeCapacity) -> Option<String> {
 /// The caller grants the first fitting entry and audits the skips before it.
 pub fn plan(requests: &[QueuedRequest], free: &FreeCapacity, now: i64) -> Vec<ScheduleEntry> {
     let mut reqs: Vec<&QueuedRequest> = requests.iter().collect();
+    // F10: sort by score first, so aging is real. The score already
+    // carries the class weight, so a class-first comparison would let
+    // a fresh P1 sit ahead of a P2 that waited 100 minutes forever.
+    // PriorityClass has no derived Ord on purpose; nothing here may
+    // compare classes directly.
     reqs.sort_by(|a, b| {
-        let ca = PriorityClass::parse_str(&a.priority_class).unwrap_or(PriorityClass::P2);
-        let cb = PriorityClass::parse_str(&b.priority_class).unwrap_or(PriorityClass::P2);
-        let class_ord = ca.cmp(&cb);
-        if class_ord != std::cmp::Ordering::Equal {
-            return class_ord;
+        let score_ord = score(b, now).cmp(&score(a, now));
+        if score_ord != std::cmp::Ordering::Equal {
+            return score_ord;
         }
         let da = a.deadline.as_deref().and_then(iso_to_unix);
         let db = b.deadline.as_deref().and_then(iso_to_unix);
@@ -82,10 +85,6 @@ pub fn plan(requests: &[QueuedRequest], free: &FreeCapacity, now: i64) -> Vec<Sc
         };
         if deadline_ord != std::cmp::Ordering::Equal {
             return deadline_ord;
-        }
-        let score_ord = score(b, now).cmp(&score(a, now));
-        if score_ord != std::cmp::Ordering::Equal {
-            return score_ord;
         }
         a.created_unix.cmp(&b.created_unix)
     });
@@ -139,6 +138,9 @@ mod tests {
             deadline: None,
             needs_bridge: false,
             needs_display: false,
+            mem_mb_max: None,
+            lease_id: None,
+            capabilities: vec![],
             created_unix: created,
             status: "queued".to_string(),
         }
@@ -153,14 +155,20 @@ mod tests {
         }
     }
 
+    /// F10: the aging test asserts sort ORDER, not just the integer
+    /// score. A P2 that waited 100 minutes (score 10) orders ahead
+    /// of a fresh P1 (score 10) only if the tie breaks by age; a
+    /// fresh P2 (score 0) stays behind.
     #[test]
-    fn class_orders_before_score() {
+    fn aging_promotes_p2_over_fresh_p1_in_order() {
         let now = now_unix();
-        let p2_old = req("old-p2", "P2", now - 3600 * 5, 1);
-        let p1_new = req("new-p1", "P1", now, 1);
-        let plan = plan(&[p2_old, p1_new], &free(), now);
-        assert_eq!(plan[0].request.job_id, "new-p1");
-        assert_eq!(plan[1].request.job_id, "old-p2");
+        let p2_aged = req("aged-p2", "P2", now - 100 * 60, 1);
+        let p1_fresh = req("fresh-p1", "P1", now, 1);
+        let p2_fresh = req("fresh-p2", "P2", now, 1);
+        let plan = plan(&[p1_fresh, p2_fresh, p2_aged], &free(), now);
+        assert_eq!(plan[0].request.job_id, "aged-p2");
+        assert_eq!(plan[1].request.job_id, "fresh-p1");
+        assert_eq!(plan[2].request.job_id, "fresh-p2");
     }
 
     #[test]

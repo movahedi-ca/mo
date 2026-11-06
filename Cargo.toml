@@ -2,6 +2,7 @@
 name = "mo"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 description = "MO Local Resource Assistant: one queue, leases, heartbeat, battery gates, dashboard"
 license = "MIT"
 
@@ -16,13 +17,27 @@ path = "src/main.rs"
 [[bin]]
 name = "mo-cli"
 path = "src/bin/mo-cli.rs"
+required-features = ["cli"]
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-clap = { version = "4", features = ["derive"] }
+# clap is optional and only the mo-cli binary takes it, so the
+# daemon binary does not carry a CLI parser (F16).
+clap = { version = "4", features = ["derive"], optional = true }
 uuid = { version = "1", features = ["v4"] }
 
+[features]
+default = []
+cli = ["dep:clap"]
+
 [profile.release]
-opt-level = 2
+# F16: the shipped profile was opt-level 2, below the Cargo
+# default of 3. panic stays unwind, not abort: a panic in the
+# field must still leave a backtrace in the log.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -4,7 +4,9 @@
 //! Dashboard never writes state. Dashboard never calls the socket.
 //! Read only. Closing the tab is safe.
 
-use crate::core::{est_label, now_unix, BatteryState, Config, Inventory};
+use crate::core::{
+    local_label, now_unix, BatteryState, Config, Desktop, Inventory, Lease, QueuedRequest,
+};
 use crate::store::Store;
 
 /// Dashboard state for the MO face.
@@ -60,8 +62,14 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Render the full dashboard page.
-pub fn render(store: &Store, inv: &Inventory, cfg: &Config) -> String {
+/// Gather every row the page needs, once. The renderer takes the
+/// gathered data and never re-queries the store, the notifier, or
+/// the desktops, so one refresh is one consistent snapshot (F15).
+pub fn gather(
+    store: &Store,
+    inv: &Inventory,
+    cfg: &Config,
+) -> (Vec<QueuedRequest>, Vec<Lease>, Vec<Desktop>, Vec<String>) {
     let queued = store.list_queued_requests().unwrap_or_default();
     let leases = store
         .list_leases(&[
@@ -72,6 +80,29 @@ pub fn render(store: &Store, inv: &Inventory, cfg: &Config) -> String {
             "extension_pending",
         ])
         .unwrap_or_default();
+    let desktops = crate::desktops::list_desktops_cached();
+    let snap = crate::notify::snapshot(store, inv, cfg);
+    let alerts: Vec<String> = snap
+        .get("alerts")
+        .and_then(|a| a.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|a| a.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    (queued, leases, desktops, alerts)
+}
+
+/// Render the full dashboard page from already-gathered data.
+pub fn render_data(
+    queued: &[QueuedRequest],
+    leases: &[Lease],
+    desktops: &[Desktop],
+    alerts: &[String],
+    inv: &Inventory,
+    cfg: &Config,
+) -> String {
     let battery_state = crate::battery::effective_state(inv.battery.as_ref());
     let face = face_for(battery_state, leases.len());
     let face_name = match face {
@@ -93,14 +124,13 @@ pub fn render(store: &Store, inv: &Inventory, cfg: &Config) -> String {
         (true, None) => "up, pool unknown".to_string(),
         (false, _) => "unknown".to_string(),
     };
-    let desktops = crate::desktops::list_desktops();
     let held: Vec<String> = leases.iter().map(|l| l.desktop.clone()).collect();
 
     let mut queue_rows = String::new();
     if queued.is_empty() {
         queue_rows.push_str("<tr><td colspan=\"6\">Queue empty</td></tr>");
     }
-    for q in &queued {
+    for q in queued {
         queue_rows.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             esc(&q.agent_id),
@@ -115,19 +145,19 @@ pub fn render(store: &Store, inv: &Inventory, cfg: &Config) -> String {
     if leases.is_empty() {
         lease_rows.push_str("<tr><td colspan=\"6\">No active leases</td></tr>");
     }
-    for l in &leases {
+    for l in leases {
         lease_rows.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             esc(&l.lease_id),
             esc(&l.agent_id),
             esc(&l.desktop),
             esc(&l.state),
-            est_label(l.start_unix),
-            est_label(l.end_unix)
+            local_label(l.start_unix),
+            local_label(l.end_unix)
         ));
     }
     let mut desk_cells = String::new();
-    for d in &desktops {
+    for d in desktops {
         let leased = held.contains(&d.id);
         let state = if d.id == "main-display" {
             "main :1"
@@ -145,15 +175,12 @@ pub fn render(store: &Store, inv: &Inventory, cfg: &Config) -> String {
             state
         ));
     }
-    let alerts = crate::notify::snapshot(store, inv, cfg);
     let mut alert_items = String::new();
-    if let Some(list) = alerts.get("alerts").and_then(|a| a.as_array()) {
-        if list.is_empty() {
-            alert_items.push_str("<li>No alerts</li>");
-        }
-        for a in list {
-            alert_items.push_str(&format!("<li>{}</li>", esc(a.as_str().unwrap_or(""))));
-        }
+    if alerts.is_empty() {
+        alert_items.push_str("<li>No alerts</li>");
+    }
+    for a in alerts {
+        alert_items.push_str(&format!("<li>{}</li>", esc(a)));
     }
     let refresh = cfg.dashboard_refresh_sec;
     format!(
@@ -171,7 +198,7 @@ pub fn render(store: &Store, inv: &Inventory, cfg: &Config) -> String {
         <h2>Queue</h2>\
         <table><tr><th>Agent</th><th>Job</th><th>Class</th><th>Priority</th><th>Desktops</th><th>Minutes</th></tr>{}</table>\
         <h2>Leases</h2>\
-        <table><tr><th>Lease</th><th>Agent</th><th>Desktop</th><th>State</th><th>Start EST</th><th>End EST</th></tr>{}</table>\
+        <table><tr><th>Lease</th><th>Agent</th><th>Desktop</th><th>State</th><th>Start</th><th>End</th></tr>{}</table>\
         <h2>Desktops</h2><div class=\"grid\">{}</div>\
         <h2>Resources</h2>\
         <p>Load: {:.2}. RAM available: {} MB of {} MB. Disk free: {:.1} GB. Chrome processes: {}. Bridge pool: {}.</p>\
@@ -182,7 +209,7 @@ pub fn render(store: &Store, inv: &Inventory, cfg: &Config) -> String {
         face_name,
         queued.len(),
         leases.len(),
-        est_label(now_unix()),
+        local_label(now_unix()),
         battery_label,
         battery_state.as_str(),
         battery_pct,
@@ -198,6 +225,13 @@ pub fn render(store: &Store, inv: &Inventory, cfg: &Config) -> String {
         alert_items,
         refresh
     )
+}
+
+/// Render from the store, for tests and one-off callers. The daemon
+/// uses gather + render_data directly.
+pub fn render(store: &Store, inv: &Inventory, cfg: &Config) -> String {
+    let (queued, leases, desktops, alerts) = gather(store, inv, cfg);
+    render_data(&queued, &leases, &desktops, &alerts, inv, cfg)
 }
 
 #[cfg(test)]
@@ -247,7 +281,9 @@ mod tests {
         let html = render(&s, &inv, &cfg);
         assert!(html.contains("<meta http-equiv=\"refresh\" content=\"30\">"));
         assert!(html.contains("MO - Local Resource Assistant"));
-        assert!(html.contains("EST"));
+        // No hardcoded EST label: the zone comes from the host.
+        assert!(!html.contains("Start EST"));
+        assert!(html.contains(&local_label(now_unix())[..10]));
         assert!(!html.contains("<script"));
         assert!(!html.contains("<form"));
         assert!(!html.contains("src=\"http"));
@@ -276,6 +312,9 @@ mod tests {
             deadline: None,
             needs_bridge: false,
             needs_display: false,
+            mem_mb_max: None,
+            lease_id: None,
+            capabilities: vec![],
             created_unix: now,
             status: "queued".to_string(),
         };

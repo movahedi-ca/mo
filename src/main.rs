@@ -17,6 +17,10 @@ fn main() {
 
 fn run() -> Result<()> {
     let cfg = Config::from_env();
+    mo::inventory::set_cache_ttl(cfg.inventory_cache_sec);
+    if let Some(parent) = std::path::Path::new(&cfg.db_path).parent() {
+        mo::inventory::set_db_dir(&parent.to_string_lossy());
+    }
     for path in [
         &cfg.db_path,
         &cfg.socket_path,
@@ -24,7 +28,9 @@ fn run() -> Result<()> {
         &cfg.dashboard_path,
     ] {
         if let Some(parent) = std::path::Path::new(path).parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                mo::core::MoError::e10(format!("cannot create dir {parent:?}: {e}"))
+            })?;
         }
     }
     // One daemon only: std File try_lock, OS released on death. V3 ADR-010.
@@ -56,54 +62,52 @@ fn run() -> Result<()> {
     // Inventory snapshot every 60 seconds, stored in the DB.
     {
         let store = store.clone();
+        let cfg = cfg.clone();
         std::thread::spawn(move || loop {
-            let inv = mo::inventory::read_inventory_fresh();
+            let dir = std::path::Path::new(&cfg.db_path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".to_string());
+            let inv = mo::inventory::read_inventory_fresh_with(&cfg, &dir);
             let _ = store.insert_snapshot(&inv);
             std::thread::sleep(std::time::Duration::from_secs(60));
         });
     }
-    // Dashboard every 30 seconds.
+    // Dashboard on the configured interval. Data is gathered once
+    // and passed in, so the renderer never re-queries the store or
+    // re-probes desktops. The file is written to a temp name and
+    // renamed, so a reload never observes a partial page (F15).
     {
         let store = store.clone();
         let cfg = cfg.clone();
         std::thread::spawn(move || loop {
             let inv = mo::inventory::read_inventory();
-            let html = mo::dashboard::render(&store, &inv, &cfg);
-            if let Err(e) = std::fs::write(&cfg.dashboard_path, html) {
-                eprintln!("mo-daemon: dashboard write failed: {e}");
+            let (queued, leases, desktops, alerts) = mo::dashboard::gather(&store, &inv, &cfg);
+            let html = mo::dashboard::render_data(&queued, &leases, &desktops, &alerts, &inv, &cfg);
+            let tmp = format!("{}.tmp", cfg.dashboard_path);
+            if std::fs::write(&tmp, html)
+                .and_then(|()| std::fs::rename(&tmp, &cfg.dashboard_path))
+                .is_err()
+            {
+                eprintln!("mo-daemon: dashboard write failed");
             }
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            std::thread::sleep(std::time::Duration::from_secs(
+                cfg.dashboard_refresh_sec.max(1) as u64,
+            ));
         });
     }
-    // Heartbeat sweep every 60 seconds: stale, expiry, reclaim.
+    // Scheduler tick every 10 seconds: expiry, stale sweep, reclaim,
+    // drain, bypass check, daily prune. Runs once at once at startup too.
     {
-        let store = store.clone();
-        let cfg = cfg.clone();
+        let daemon = daemon.clone();
         std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            let now = now_unix();
-            let _ = mo::lease::sweep_stale(&store, now, &cfg);
-            let _ = mo::lease::expire_leases(&store, now);
-            if let Ok(stale) = store.list_leases(&["stale", "expired"]) {
-                for lease in stale {
-                    let probe = mo::lease::ReclaimProbe {
-                        cdp_ok: lease.cdp_port.map(mo::desktops::cdp_ok).unwrap_or(false),
-                        chrome_alive: lease
-                            .profile
-                            .as_deref()
-                            .map(mo::desktops::chrome_alive_for_profile)
-                            .unwrap_or(false),
-                        lock_held: lease
-                            .profile
-                            .as_deref()
-                            .map(|p| !mo::desktops::profile_lock_free(p))
-                            .unwrap_or(false),
-                    };
-                    let _ = mo::lease::reclaim_check(&store, &lease.lease_id, now, &cfg, &probe);
-                }
-            }
+            let _ = daemon.tick();
+            std::thread::sleep(std::time::Duration::from_secs(10));
         });
     }
+    // Drain once at startup: capacity that came back while MO was down
+    // grants queued requests without waiting for a new request.
+    let _ = daemon.drain_queue();
     println!(
         "mo-daemon up: db={} socket={} host={}",
         cfg.db_path, cfg.socket_path, cfg.host_name

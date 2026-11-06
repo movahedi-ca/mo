@@ -4,3 +4,6 @@
 *.db-shm
 *.sock
 *.lock
+
+# Cargo.lock is pinned and committed (F16); only other *.lock files are ignored.
+!Cargo.lock

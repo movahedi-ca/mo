@@ -3,7 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// One MO error: a code from V3 section 6.2 plus a message and a next action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +88,15 @@ impl std::error::Error for MoError {}
 
 impl From<rusqlite::Error> for MoError {
     fn from(e: rusqlite::Error) -> Self {
-        MoError::e10(format!("SQLite error: {e}"))
+        match e.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::ConstraintViolation) => {
+                MoError::e04(format!("SQLite constraint: {e}"))
+            }
+            Some(rusqlite::ffi::ErrorCode::DiskFull) => {
+                MoError::e07(format!("SQLite disk full: {e}"))
+            }
+            _ => MoError::e10(format!("SQLite error: {e}")),
+        }
     }
 }
 
@@ -136,7 +145,9 @@ impl ResourceClass {
 }
 
 /// Priority class. P0 is human and main display only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+// No derived Ord: the scheduler must never trust declaration
+// order. Compare classes with weight(), never with cmp (F10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PriorityClass {
     P0,
     P1,
@@ -230,7 +241,12 @@ impl LeaseState {
     pub fn holds_desktop(&self) -> bool {
         matches!(
             self,
-            Self::Reserving | Self::Granted | Self::Active | Self::Stale | Self::ExtensionPending
+            Self::Reserving
+                | Self::Granted
+                | Self::Active
+                | Self::Stale
+                | Self::ExtensionPending
+                | Self::Interrupted
         )
     }
     /// Terminal states: no further move.
@@ -341,6 +357,7 @@ pub struct Lease {
     pub heartbeat_due_unix: i64,
     pub heartbeat_misses: i64,
     pub extensions: i64,
+    pub last_heartbeat_unix: i64,
     pub created_unix: i64,
 }
 
@@ -360,6 +377,9 @@ pub struct QueuedRequest {
     pub deadline: Option<String>,
     pub needs_bridge: bool,
     pub needs_display: bool,
+    pub mem_mb_max: Option<i64>,
+    pub lease_id: Option<String>,
+    pub capabilities: Vec<String>,
     pub created_unix: i64,
     pub status: String,
 }
@@ -432,7 +452,6 @@ pub struct Config {
     pub lock_path: String,
     pub dashboard_path: String,
     pub host_name: String,
-    pub lease_default_min: i64,
     pub lease_max_min: i64,
     pub extend_max_min: i64,
     pub heartbeat_min: i64,
@@ -443,6 +462,7 @@ pub struct Config {
     pub idle_fold_min: i64,
     pub expand_queue_depth: i64,
     pub ram_guard_mb: i64,
+    pub chrome_budget_mb: i64,
     pub disk_guard_gb: i64,
     pub battery_warn: i64,
     pub battery_restrict: i64,
@@ -453,6 +473,17 @@ pub struct Config {
 
 fn home_dir() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/home/auto".to_string())
+}
+
+/// Chrome profile root. Overridable with MO_PROFILE_ROOT; otherwise
+/// $HOME/.config. No desktop path hardcodes /home/auto any more (j).
+pub fn profile_root() -> String {
+    std::env::var("MO_PROFILE_ROOT").unwrap_or_else(|_| format!("{}/.config", home_dir()))
+}
+
+/// Jobs dir for the vd scripts. Overridable with MO_JOBS_DIR.
+pub fn jobs_dir() -> String {
+    std::env::var("MO_JOBS_DIR").unwrap_or_else(|_| format!("{}/jobs", home_dir()))
 }
 
 fn env_i64(name: &str, default: i64) -> i64 {
@@ -473,7 +504,6 @@ impl Config {
             dashboard_path: std::env::var("MO_DASHBOARD_PATH")
                 .unwrap_or(format!("{base}/dashboard.html")),
             host_name: std::env::var("MO_HOST").unwrap_or_else(|_| "chromebook-vm".to_string()),
-            lease_default_min: env_i64("MO_LEASE_DEFAULT_MIN", 30),
             lease_max_min: env_i64("MO_LEASE_MAX_MIN", 120),
             extend_max_min: env_i64("MO_EXTEND_MAX_MIN", 30),
             heartbeat_min: env_i64("MO_HEARTBEAT_MIN", 5),
@@ -484,6 +514,7 @@ impl Config {
             idle_fold_min: env_i64("MO_IDLE_FOLD_MIN", 15),
             expand_queue_depth: env_i64("MO_EXPAND_QUEUE_DEPTH", 2),
             ram_guard_mb: env_i64("MO_RAM_GUARD_MB", 1200),
+            chrome_budget_mb: env_i64("MO_CHROME_BUDGET_MB", 1024),
             disk_guard_gb: env_i64("MO_DISK_GUARD_GB", 1),
             battery_warn: env_i64("MO_BATTERY_WARN", 20),
             battery_restrict: env_i64("MO_BATTERY_RESTRICT", 10),
@@ -496,40 +527,75 @@ impl Config {
 
 // ---- Time helpers: std only, no chrono ----
 
+/// Wall clock anchored at boot and advanced by a monotonic timer.
+/// Intervals (expiry, heartbeat, deadlines) never jump when the
+/// wall clock steps (NTP, manual set). The anchor is taken once per
+/// process, so the value only ever moves forward.
 pub fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    static BOOT: OnceLock<(i64, Instant)> = OnceLock::new();
+    let (boot_unix, boot_instant) = BOOT.get_or_init(|| {
+        let boot_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        (boot_unix, Instant::now())
+    });
+    boot_unix + boot_instant.elapsed().as_secs() as i64
 }
 
-/// Unix epoch to ISO 8601 with a fixed hour offset (EST is -5).
-pub fn unix_to_iso(unix: i64, offset_hours: i64) -> String {
-    let secs = unix + offset_hours * 3600;
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (hour, min, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let (year, month, day) = civil_from_days(days);
-    let sign = if offset_hours < 0 { '-' } else { '+' };
+/// Unix epoch to ISO 8601 in the host's local zone. The offset and
+/// zone come from the host (libc localtime_r), never a hardcoded
+/// -5. On America/Toronto this prints -05:00 in winter and -04:00
+/// in summer, matching what the clock on the host says (F15).
+pub fn unix_to_local_iso(unix: i64) -> String {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t: libc::time_t = unix as libc::time_t;
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return format!("{unix}");
+    }
+    let off = tm.tm_gmtoff;
+    let sign = if off < 0 { '-' } else { '+' };
+    let (ah, am) = (off.unsigned_abs() / 3600, (off.unsigned_abs() % 3600) / 60);
     format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}{sign}{:02}:00",
-        offset_hours.abs()
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        sign,
+        ah,
+        am
     )
 }
 
-/// Days since epoch to civil date. Howard Hinnant's algorithm.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+/// Local label for the dashboard: "2026-11-06 14:37 EST" on a host
+/// in EST, "2026-11-06 14:37 EDT" in daylight time, "UTC" on a host
+/// with no zone. The zone abbreviation is read from the host, never
+/// printed as a constant (F15).
+pub fn local_label(unix: i64) -> String {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t: libc::time_t = unix as libc::time_t;
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return format!("{unix}");
+    }
+    let zone = if tm.tm_zone.is_null() {
+        "UTC".to_string()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} {}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        zone
+    )
 }
 
 /// Parse a subset of ISO 8601 (YYYY-MM-DDTHH:MM:SS with offset) to unix epoch.
@@ -582,15 +648,19 @@ pub fn new_lease_id() -> String {
     format!("mo-{}-{hex}", now_unix())
 }
 
-/// EST label for the dashboard: "2026-11-06 14:37:41 EST".
-pub fn est_label(unix: i64) -> String {
-    let iso = unix_to_iso(unix, -5);
-    format!("{} EST", iso.replace('T', " ").replace("-05:00", ""))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_root_honors_env() {
+        // SAFETY: no other test reads MO_PROFILE_ROOT, so setting it
+        // here cannot disturb a parallel test.
+        std::env::set_var("MO_PROFILE_ROOT", "/tmp/fake-profiles");
+        assert_eq!(profile_root(), "/tmp/fake-profiles");
+        std::env::remove_var("MO_PROFILE_ROOT");
+        assert!(profile_root().ends_with("/.config"));
+    }
 
     #[test]
     fn lease_id_format() {
@@ -605,14 +675,41 @@ mod tests {
     #[test]
     fn iso_round_trip() {
         let unix = 1793992800;
-        let iso = unix_to_iso(unix, -5);
+        let iso = unix_to_local_iso(unix);
         assert_eq!(iso_to_unix(&iso), Some(unix));
+    }
+
+    #[test]
+    fn now_never_goes_backwards() {
+        let a = now_unix();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let b = now_unix();
+        assert!(b >= a, "{a} -> {b}");
     }
 
     #[test]
     fn error_codes_present() {
         assert_eq!(MoError::e14("x").code, "E14");
         assert_eq!(MoError::e01("x").code, "E01");
+    }
+
+    #[test]
+    fn sqlite_error_codes_map() {
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("UNIQUE constraint failed".to_string()),
+        );
+        assert_eq!(MoError::from(constraint).code, "E04");
+        let full = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("database or disk is full".to_string()),
+        );
+        assert_eq!(MoError::from(full).code, "E07");
+        let other = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERNAL),
+            Some("boom".to_string()),
+        );
+        assert_eq!(MoError::from(other).code, "E10");
     }
 
     #[test]

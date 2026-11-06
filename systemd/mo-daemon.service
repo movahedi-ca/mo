@@ -1,15 +1,19 @@
 [Unit]
 Description=MO Local Resource Assistant daemon
-After=network.target
-Wants=network.target
+# The daemon binds only a Unix socket and probes localhost, so it
+# does not wait on the network. default.target ordering is enough.
+After=default.target
+# DEFECT-005: StartLimitBurst and StartLimitIntervalSec are [Unit]
+# directives. Under [Service] systemd ignored them and restart
+# rate limiting was inactive.
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/mo-daemon
 Restart=on-failure
 RestartSec=5
-StartLimitBurst=5
-StartLimitIntervalSec=60
 Environment=MO_DB_PATH=%h/jobs/mo/mo.db
 Environment=MO_SOCKET_PATH=%h/jobs/mo/mo.sock
 Environment=MO_LOCK_PATH=%h/jobs/mo/mo.lock

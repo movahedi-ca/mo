@@ -5,13 +5,32 @@
 
 use crate::core::{Battery, BatteryState, Config, MoError, PriorityClass, Result};
 
+/// Test hook: force read_battery() to return `b` while set. Test-only,
+/// so a drain test can put the host in Warn without a fake sysfs tree.
+/// Call with None to restore the real sensor read.
+#[cfg(test)]
+static TEST_BATTERY: std::sync::Mutex<Option<Option<Battery>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub fn set_test_battery(b: Option<Battery>) {
+    *TEST_BATTERY.lock().unwrap() = Some(b);
+}
+
 /// Read /sys/class/power_supply/BAT0. None when the sensor is missing.
 pub fn read_battery() -> Option<Battery> {
-    read_battery_at("/sys/class/power_supply/BAT0")
+    #[cfg(test)]
+    if let Ok(guard) = TEST_BATTERY.lock() {
+        if let Some(b) = &*guard {
+            return b.clone();
+        }
+    }
+    read_battery_at("/sys/class/power_supply/BAT0", &Config::from_env())
 }
 
 /// Read a BAT0 directory. Exposed for tests with a fake sysfs tree.
-pub fn read_battery_at(base: &str) -> Option<Battery> {
+/// The config is passed in: the classifier needs the thresholds, and
+/// reading them from env on every call hid a real dependency.
+pub fn read_battery_at(base: &str, cfg: &Config) -> Option<Battery> {
     let cap_path = format!("{base}/capacity");
     let status_path = format!("{base}/status");
     if !std::path::Path::new(&cap_path).exists() && !std::path::Path::new(&status_path).exists() {
@@ -24,8 +43,7 @@ pub fn read_battery_at(base: &str) -> Option<Battery> {
         .ok()
         .unwrap_or_default();
     let charging = status.trim() == "Charging" || status.trim() == "Full";
-    let cfg = Config::from_env();
-    let state = state_for(pct, charging, &cfg);
+    let state = state_for(pct, charging, cfg);
     Some(Battery {
         pct,
         charging,
@@ -145,13 +163,13 @@ mod tests {
 
     #[test]
     fn missing_sensor_is_none() {
-        assert!(read_battery_at("/tmp/mo-no-such-bat0-xyz").is_none());
+        assert!(read_battery_at("/tmp/mo-no-such-bat0-xyz", &Config::from_env()).is_none());
     }
 
     #[test]
     fn fake_sysfs_reads() {
         let (dir, base) = fake_bat("42", "Discharging");
-        let b = read_battery_at(&base).unwrap();
+        let b = read_battery_at(&base, &Config::from_env()).unwrap();
         assert_eq!(b.pct, Some(42));
         assert!(!b.charging);
         assert_eq!(b.state, BatteryState::Normal);

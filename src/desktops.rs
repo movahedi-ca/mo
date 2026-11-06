@@ -8,14 +8,37 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 fn vd_start_script() -> String {
-    std::env::var("MO_VD_START_SCRIPT").unwrap_or("/home/auto/jobs/vd-start.sh".to_string())
+    std::env::var("MO_VD_START_SCRIPT")
+        .unwrap_or_else(|_| format!("{}/vd-start.sh", crate::core::jobs_dir()))
 }
 
 fn vd_stop_script() -> String {
-    std::env::var("MO_VD_STOP_SCRIPT").unwrap_or("/home/auto/jobs/vd-stop.sh".to_string())
+    std::env::var("MO_VD_STOP_SCRIPT")
+        .unwrap_or_else(|_| format!("{}/vd-stop.sh", crate::core::jobs_dir()))
 }
 
 /// Static desktop list with live up status from CDP.
+/// Desktop bitmap cached for 5 seconds. The probe, the dashboard,
+/// and the bypass check share one read instead of each opening 11
+/// CDP connections.
+static DESKTOP_CACHE: std::sync::Mutex<Option<(Vec<Desktop>, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+pub fn list_desktops_cached() -> Vec<Desktop> {
+    if let Ok(guard) = DESKTOP_CACHE.lock() {
+        if let Some((ds, at)) = guard.as_ref() {
+            if at.elapsed() < std::time::Duration::from_secs(5) {
+                return ds.clone();
+            }
+        }
+    }
+    let ds = list_desktops();
+    if let Ok(mut guard) = DESKTOP_CACHE.lock() {
+        *guard = Some((ds.clone(), std::time::Instant::now()));
+    }
+    ds
+}
+
 pub fn list_desktops() -> Vec<Desktop> {
     let mut out = vec![Desktop {
         id: "main-display".to_string(),
@@ -33,7 +56,7 @@ pub fn list_desktops() -> Vec<Desktop> {
             display: format!(":{}", n + 1),
             cdp_port: Some(port),
             vnc_port: Some(5902 + n),
-            profile: Some(format!("/home/auto/.config/chrome-vd{n}")),
+            profile: Some(format!("{}/chrome-vd{n}", crate::core::profile_root())),
             up: cdp_ok(port),
             leased: false,
         });
@@ -127,14 +150,21 @@ pub fn start_desktop(id: &str) -> Result<Desktop> {
         display: format!(":{}", n + 1),
         cdp_port: Some(port),
         vnc_port: Some(5902 + n),
-        profile: Some(format!("/home/auto/.config/chrome-vd{n}")),
+        profile: Some(format!("{}/chrome-vd{n}", crate::core::profile_root())),
         up: true,
         leased: false,
     })
 }
 
 /// Provision step for a lease grant: start and wait for CDP.
+/// Start a desktop for a grant. Battery-gated like expand: no new
+/// vd start at Warn or worse. A host with no battery sensor has no
+/// battery gate, so a battery-less host with desktops can still start one.
 pub fn provision_desktop(id: &str) -> Result<()> {
+    if let Some(b) = crate::battery::read_battery() {
+        let state = crate::battery::effective_state(Some(&b));
+        crate::battery::can_start_vd(state)?;
+    }
     start_desktop(id).map(|_| ())
 }
 
@@ -225,10 +255,13 @@ pub fn fold_check(store: &Store, desktop: &str, now: i64, cfg: &Config) -> Resul
     let mut recent_heartbeat = false;
     for l in active.iter().chain(stale.iter()) {
         if l.desktop == desktop {
-            if let Some(last) = store.last_heartbeat(&l.lease_id)? {
-                if now - last < cfg.idle_fold_min * 60 {
-                    recent_heartbeat = true;
-                }
+            let last = if l.last_heartbeat_unix > 0 {
+                l.last_heartbeat_unix
+            } else {
+                l.start_unix
+            };
+            if now - last < cfg.idle_fold_min * 60 {
+                recent_heartbeat = true;
             }
         }
     }
@@ -265,6 +298,13 @@ pub fn fold_desktop(store: &Store, desktop: &str, now: i64, cfg: &Config) -> Res
     if desktop == "main-display" {
         return Err(MoError::e14("main display :1 is protected"));
     }
+    // DEFECT-004: a desktop whose stop failed is flagged. Fold refuses
+    // it until an operator clears the flag with `mo-cli clear-flag`.
+    if store.is_flagged(desktop)? {
+        return Err(MoError::e13(format!(
+            "fold refused for {desktop}: desktop is flagged, clear the flag first"
+        )));
+    }
     let report = fold_check(store, desktop, now, cfg)?;
     if !report.all_pass() {
         return Err(MoError::e13(format!(
@@ -272,7 +312,12 @@ pub fn fold_desktop(store: &Store, desktop: &str, now: i64, cfg: &Config) -> Res
             report.failed_checks().join(", ")
         )));
     }
-    stop_desktop(desktop)?;
+    if let Err(e) = stop_desktop(desktop) {
+        let reason = format!("stop failed on fold: {}", e.message);
+        let _ = store.audit("stop_failed", None, None, None, Some(desktop), &reason, now);
+        let _ = store.flag_desktop(desktop, &reason, now);
+        return Err(e);
+    }
     store.audit(
         "fold",
         None,
@@ -285,17 +330,24 @@ pub fn fold_desktop(store: &Store, desktop: &str, now: i64, cfg: &Config) -> Res
     Ok(())
 }
 
-/// Expand rule: queue depth 2+, MemAvailable over 1500 MB, active vd under 6.
+/// Expand rule: queue depth, MemAvailable over guard plus one Chrome
+/// budget, active vd under sustained. The 1500 MB literal is gone.
 pub fn should_expand(queue_depth: i64, inv: &Inventory, cfg: &Config, active_vd: i64) -> bool {
     queue_depth >= cfg.expand_queue_depth
-        && inv.mem_available_mb > 1500
+        && inv.mem_available_mb > cfg.ram_guard_mb + cfg.chrome_budget_mb
         && active_vd < cfg.sustained_vd
 }
 
 /// Expand one desktop: the first vd that is down. None when all are up.
+/// Battery-gated: no new vd start at Warn or worse. A host with no
+/// battery sensor has no battery gate.
 pub fn expand_one(store: &Store, now: i64) -> Result<Option<String>> {
     let _ = store;
     let _ = now;
+    if let Some(b) = crate::battery::read_battery() {
+        let state = crate::battery::effective_state(Some(&b));
+        crate::battery::can_start_vd(state)?;
+    }
     for d in list_desktops() {
         if d.id != "main-display" && !d.up {
             start_desktop(&d.id)?;
@@ -319,6 +371,43 @@ mod tests {
         assert_eq!(ds[10].id, "vd10");
         assert_eq!(ds[1].cdp_port, Some(9333));
         assert_eq!(ds[1].vnc_port, Some(5903));
+    }
+
+    /// DEFECT-004: a flagged desktop is refused by fold with E13, and a
+    /// stop failure on fold audits "stop_failed" and flags the desktop.
+    #[test]
+    fn fold_refuses_flagged_desktop() {
+        let now = now_unix();
+        let p = format!(
+            "/tmp/mo-d-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let s = Store::open(&p).unwrap();
+        let cfg = Config::from_env();
+        s.flag_desktop("vd1", "stop failed on release", now)
+            .unwrap();
+        let err = fold_desktop(&s, "vd1", now, &cfg).unwrap_err();
+        assert_eq!(err.code, "E13");
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// F11: provision refuses to start a desktop at battery Warn.
+    #[test]
+    fn provision_blocked_at_battery_warn() {
+        use crate::core::{Battery, BatteryState};
+        crate::battery::set_test_battery(Some(Battery {
+            pct: Some(15),
+            charging: false,
+            present: true,
+            state: BatteryState::Warn,
+        }));
+        let err = provision_desktop("vd1").unwrap_err();
+        assert_eq!(err.code, "E05");
+        crate::battery::set_test_battery(None);
     }
 
     #[test]
@@ -390,6 +479,7 @@ mod tests {
             heartbeat_due_unix: now + 300,
             heartbeat_misses: 0,
             extensions: 0,
+            last_heartbeat_unix: 0,
             created_unix: now,
         };
         s.with_tx(|tx| {
@@ -408,14 +498,16 @@ mod tests {
     #[test]
     fn expand_rule() {
         let cfg = Config::from_env();
+        // Threshold is guard + one Chrome budget: 1200 + 1024 = 2224.
+        assert_eq!(cfg.ram_guard_mb + cfg.chrome_budget_mb, 2224);
         let inv = Inventory {
-            mem_available_mb: 2000,
+            mem_available_mb: 3000,
             ..Default::default()
         };
         assert!(should_expand(2, &inv, &cfg, 3));
         assert!(!should_expand(1, &inv, &cfg, 3));
         let low = Inventory {
-            mem_available_mb: 1000,
+            mem_available_mb: 2000,
             ..Default::default()
         };
         assert!(!should_expand(5, &low, &cfg, 3));

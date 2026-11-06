@@ -2,6 +2,7 @@
 //! V3 playbook: one SQLite file, Unix socket only, no HTTP, no LLM.
 
 pub mod battery;
+#[cfg(feature = "cli")]
 pub mod cli;
 pub mod core;
 pub mod dashboard;

@@ -35,6 +35,8 @@ pub fn snapshot(store: &Store, inv: &Inventory, _cfg: &Config) -> Value {
             a.event == "stale"
                 || a.event == "reclaim_flagged"
                 || a.event == "grant_failed"
+                || a.event == "bypass"
+                || a.event == "stop_failed"
                 || a.event == "recovery_rollback"
         })
         .map(|a| format!("{}: {}", a.event, a.detail))

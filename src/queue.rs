@@ -51,8 +51,11 @@ pub fn validate_request(req: &LeaseRequest, caps: &Capabilities) -> Result<()> {
             return Err(MoError::e01("mem_mb_max must be at least mem_mb"));
         }
     }
-    if !(0..=2).contains(&req.desktops) {
-        return Err(MoError::e01("desktops must be 0 to 2"));
+    // F07: one lease holds one desktop. A request for 2 desktops was
+    // accepted and then granted a single one. Reject it at the door
+    // until an N-desktop reserve exists.
+    if !matches!(req.desktops, 0 | 1) {
+        return Err(MoError::e01("desktops must be 0 or 1"));
     }
     if !(5..=120).contains(&req.duration_min) {
         return Err(MoError::e03(format!(
@@ -122,6 +125,9 @@ pub fn submit(
         deadline: req.deadline.clone(),
         needs_bridge: req.needs_bridge,
         needs_display: req.needs_display,
+        mem_mb_max: req.mem_mb_max,
+        lease_id: None,
+        capabilities: req.capabilities.clone(),
         created_unix: now,
         status: "queued".to_string(),
     };
