@@ -1,9 +1,12 @@
-//! mo-daemon entry. TASK-003 skeleton: config load, lock, store open.
-//! Wiring of server, inventory, dashboard, heartbeat lands in later tasks.
+//! mo-daemon entry.
+//! One writer, one SQLite connection, Unix socket only.
+//! Threads: server loop, 60s inventory snapshot, 30s dashboard,
+//! 60s heartbeat sweep. No HTTP, no LLM, no network port.
 
-use mo::core::{Config, Result};
+use mo::core::{now_unix, Config, Result};
 use std::fs::OpenOptions;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 
 fn main() {
     if let Err(e) = run() {
@@ -33,15 +36,77 @@ fn run() -> Result<()> {
     if lock_file.try_lock().is_err() {
         return Err(mo::core::MoError::e11("mo-daemon already running"));
     }
-    let _store = (); // Store open lands in TASK-008.
-                     // Socket mode 600: set on the socket file after bind in server.rs.
     let _ = std::fs::set_permissions(&cfg.lock_path, std::fs::Permissions::from_mode(0o600));
-    println!(
-        "mo-daemon up: db={} socket={}",
-        cfg.db_path, cfg.socket_path
-    );
-    // Server loop lands in TASK-013. Skeleton parks here.
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
+    let store = Arc::new(mo::store::Store::open(&cfg.db_path)?);
+    // Crash recovery on start. Reboot is detected from /proc/stat btime.
+    let rebooted = mo::store::rebooted_since_last_run(&store);
+    let report = mo::store::recover_on_start(&store, now_unix(), rebooted)?;
+    if !report.rolled_back.is_empty() || !report.interrupted.is_empty() {
+        eprintln!(
+            "mo-daemon: recovery rolled back {:?}, interrupted {:?}",
+            report.rolled_back, report.interrupted
+        );
     }
+    let adapter = mo::host::adapter_for(&cfg.host_name)?;
+    let daemon = Arc::new(mo::server::Daemon::new(
+        store.clone(),
+        cfg.clone(),
+        adapter.into(),
+    ));
+    // Inventory snapshot every 60 seconds, stored in the DB.
+    {
+        let store = store.clone();
+        std::thread::spawn(move || loop {
+            let inv = mo::inventory::read_inventory_fresh();
+            let _ = store.insert_snapshot(&inv);
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        });
+    }
+    // Dashboard every 30 seconds.
+    {
+        let store = store.clone();
+        let cfg = cfg.clone();
+        std::thread::spawn(move || loop {
+            let inv = mo::inventory::read_inventory();
+            let html = mo::dashboard::render(&store, &inv, &cfg);
+            if let Err(e) = std::fs::write(&cfg.dashboard_path, html) {
+                eprintln!("mo-daemon: dashboard write failed: {e}");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+    }
+    // Heartbeat sweep every 60 seconds: stale, expiry, reclaim.
+    {
+        let store = store.clone();
+        let cfg = cfg.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let now = now_unix();
+            let _ = mo::lease::sweep_stale(&store, now, &cfg);
+            let _ = mo::lease::expire_leases(&store, now);
+            if let Ok(stale) = store.list_leases(&["stale", "expired"]) {
+                for lease in stale {
+                    let probe = mo::lease::ReclaimProbe {
+                        cdp_ok: lease.cdp_port.map(mo::desktops::cdp_ok).unwrap_or(false),
+                        chrome_alive: lease
+                            .profile
+                            .as_deref()
+                            .map(mo::desktops::chrome_alive_for_profile)
+                            .unwrap_or(false),
+                        lock_held: lease
+                            .profile
+                            .as_deref()
+                            .map(|p| !mo::desktops::profile_lock_free(p))
+                            .unwrap_or(false),
+                    };
+                    let _ = mo::lease::reclaim_check(&store, &lease.lease_id, now, &cfg, &probe);
+                }
+            }
+        });
+    }
+    println!(
+        "mo-daemon up: db={} socket={} host={}",
+        cfg.db_path, cfg.socket_path, cfg.host_name
+    );
+    daemon.serve(&cfg.socket_path)
 }

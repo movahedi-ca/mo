@@ -139,7 +139,7 @@ impl HostAdapter for GenericAdapter {
 }
 
 /// Pick an adapter by host name. Unknown host is E12.
-pub fn adapter_for(host: &str) -> Result<Box<dyn HostAdapter>> {
+pub fn adapter_for(host: &str) -> Result<Box<dyn HostAdapter + Send + Sync>> {
     match host {
         "chromebook-vm" | "chromebook" => Ok(Box::new(ChromebookAdapter)),
         "oracle-a1" | "oracle" => Ok(Box::new(OracleAdapter)),
