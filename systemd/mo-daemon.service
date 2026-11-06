@@ -1,0 +1,23 @@
+[Unit]
+Description=MO Local Resource Assistant daemon
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mo-daemon
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+Environment=MO_DB_PATH=%h/jobs/mo/mo.db
+Environment=MO_SOCKET_PATH=%h/jobs/mo/mo.sock
+Environment=MO_LOCK_PATH=%h/jobs/mo/mo.lock
+Environment=MO_DASHBOARD_PATH=%h/jobs/mo/dashboard.html
+Environment=MO_HOST=chromebook-vm
+# One daemon only: std File try_lock on MO_LOCK_PATH, error E11 on second start.
+# Inventory snapshot every 60s and dashboard refresh every 30s run inside
+# the daemon. No separate timer unit is needed for either.
+
+[Install]
+WantedBy=default.target

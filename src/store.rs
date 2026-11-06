@@ -539,6 +539,195 @@ impl Store {
         }
         Ok((cpu, mem, desktops))
     }
+
+    /// Set a schema_meta key. Used by recovery to record the boot id.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        conn.execute(
+            "INSERT INTO schema_meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key=?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(v)
+    }
+}
+
+/// Crash recovery report. V3 section 13.4.
+#[derive(Debug, Default)]
+pub struct RecoveryReport {
+    pub rolled_back: Vec<String>,
+    pub interrupted: Vec<String>,
+    pub activated: Vec<String>,
+    pub desktops_to_verify: Vec<String>,
+}
+
+/// Boot time from /proc/stat btime. None when unreadable.
+pub fn boot_unix() -> Option<i64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    for line in stat.lines() {
+        if let Some(v) = line.strip_prefix("btime ") {
+            return v.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Crash recovery on daemon start. V3 section 13.4, crash points 1-7.
+/// `reboot` is true when the host booted since the last daemon run.
+/// RESERVING older than 5 min rolls back. GRANTED verifies its desktop:
+/// CDP alive activates, else rolls back. On reboot, ACTIVE and GRANTED
+/// leases become INTERRUPTED and agents must re-heartbeat within 10 min.
+/// Recovery is idempotent: a second run finds nothing to do.
+pub fn recover_on_start(store: &Store, now: i64, reboot: bool) -> Result<RecoveryReport> {
+    let mut report = RecoveryReport::default();
+    const STALE_SECS: i64 = 300;
+    // Crash point 3/4: RESERVING older than 5 minutes.
+    let reserving = store.list_leases(&["reserving"])?;
+    for lease in reserving {
+        if now - lease.created_unix > STALE_SECS {
+            let id = lease.lease_id.clone();
+            let desktop = lease.desktop.clone();
+            store.with_tx(|tx| {
+                Store::delete_reservations_tx(tx, &id)?;
+                Store::update_lease_state_tx(tx, &id, "failed")?;
+                Store::audit_tx(
+                    tx,
+                    "recovery_rollback",
+                    Some(&lease.agent_id),
+                    Some(&lease.job_id),
+                    Some(&id),
+                    Some(&desktop),
+                    "crash during reservation: rolled back",
+                    now,
+                )?;
+                Ok(())
+            })?;
+            report.rolled_back.push(id);
+            if desktop != "none" {
+                report.desktops_to_verify.push(desktop);
+            }
+        }
+    }
+    // Crash point 5: GRANTED, not yet ACTIVE.
+    let granted = store.list_leases(&["granted"])?;
+    for lease in granted {
+        let id = lease.lease_id.clone();
+        let desktop = lease.desktop.clone();
+        if reboot {
+            store.with_tx(|tx| {
+                Store::update_lease_state_tx(tx, &id, "interrupted")?;
+                Store::audit_tx(
+                    tx,
+                    "recovery_interrupted",
+                    Some(&lease.agent_id),
+                    Some(&lease.job_id),
+                    Some(&id),
+                    Some(&desktop),
+                    "host reboot: lease interrupted",
+                    now,
+                )?;
+                Ok(())
+            })?;
+            report.interrupted.push(id);
+            continue;
+        }
+        let cdp_alive = match lease.cdp_port {
+            Some(p) => crate::desktops::cdp_ok(p),
+            None => true,
+        };
+        if cdp_alive && now - lease.created_unix <= STALE_SECS {
+            store.with_tx(|tx| {
+                Store::update_lease_state_tx(tx, &id, "active")?;
+                Store::audit_tx(
+                    tx,
+                    "recovery_activated",
+                    Some(&lease.agent_id),
+                    Some(&lease.job_id),
+                    Some(&id),
+                    Some(&desktop),
+                    "desktop verified: lease activated",
+                    now,
+                )?;
+                Ok(())
+            })?;
+            report.activated.push(id);
+        } else {
+            store.with_tx(|tx| {
+                Store::delete_reservations_tx(tx, &id)?;
+                Store::update_lease_state_tx(tx, &id, "failed")?;
+                Store::audit_tx(
+                    tx,
+                    "recovery_rollback",
+                    Some(&lease.agent_id),
+                    Some(&lease.job_id),
+                    Some(&id),
+                    Some(&desktop),
+                    "granted lease never activated: rolled back",
+                    now,
+                )?;
+                Ok(())
+            })?;
+            report.rolled_back.push(id);
+            if desktop != "none" {
+                report.desktops_to_verify.push(desktop);
+            }
+        }
+    }
+    // Crash point 7 / reboot: ACTIVE leases become INTERRUPTED on reboot.
+    if reboot {
+        let active = store.list_leases(&["active", "stale", "extension_pending"])?;
+        for lease in active {
+            let id = lease.lease_id.clone();
+            let desktop = lease.desktop.clone();
+            store.with_tx(|tx| {
+                Store::update_lease_state_tx(tx, &id, "interrupted")?;
+                Store::audit_tx(
+                    tx,
+                    "recovery_interrupted",
+                    Some(&lease.agent_id),
+                    Some(&lease.job_id),
+                    Some(&id),
+                    Some(&desktop),
+                    "host reboot: lease interrupted, agent must re-heartbeat in 10 min",
+                    now,
+                )?;
+                Ok(())
+            })?;
+            report.interrupted.push(id);
+        }
+    }
+    // Record this boot so the next start can tell reboot from restart.
+    if let Some(btime) = boot_unix() {
+        store.set_meta("last_boot_unix", &btime.to_string())?;
+    }
+    Ok(report)
+}
+
+/// True when the host booted since the last daemon run.
+pub fn rebooted_since_last_run(store: &Store) -> bool {
+    match (boot_unix(), store.get_meta("last_boot_unix")) {
+        (Some(btime), Ok(Some(prev))) => prev != btime.to_string(),
+        (Some(_), Ok(None)) => false,
+        _ => false,
+    }
 }
 
 fn row_to_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedRequest> {
@@ -740,5 +929,92 @@ mod tests {
     fn request_type_is_referenced() {
         let r = LeaseRequest::default();
         assert_eq!(r.duration_min, 30);
+    }
+
+    #[test]
+    fn recovery_rolls_back_stale_reserving() {
+        let p = tmp_path();
+        let s = Store::open(&p).unwrap();
+        let now = now_unix();
+        let old = sample_lease("mo-r-1", "vd1", "reserving");
+        let mut old = old;
+        old.created_unix = now - 600;
+        s.with_tx(|tx| {
+            Store::insert_lease_tx(tx, &old)?;
+            Store::insert_reservation_tx(tx, "mo-r-1", "vd1", 1, 512, 0, now - 600)?;
+            Ok(())
+        })
+        .unwrap();
+        // Fresh RESERVING (under 5 min) is left alone.
+        let fresh = sample_lease("mo-r-2", "vd2", "reserving");
+        s.with_tx(|tx| {
+            Store::insert_lease_tx(tx, &fresh)?;
+            Ok(())
+        })
+        .unwrap();
+        let report = recover_on_start(&s, now, false).unwrap();
+        assert_eq!(report.rolled_back, vec!["mo-r-1".to_string()]);
+        assert_eq!(s.get_lease("mo-r-1").unwrap().unwrap().state, "failed");
+        assert_eq!(s.get_lease("mo-r-2").unwrap().unwrap().state, "reserving");
+        // Idempotent: second run finds nothing.
+        let report2 = recover_on_start(&s, now, false).unwrap();
+        assert!(report2.rolled_back.is_empty());
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn recovery_marks_interrupted_on_reboot() {
+        let p = tmp_path();
+        let s = Store::open(&p).unwrap();
+        let now = now_unix();
+        let active = sample_lease("mo-r-3", "vd1", "active");
+        s.with_tx(|tx| {
+            Store::insert_lease_tx(tx, &active)?;
+            Ok(())
+        })
+        .unwrap();
+        let report = recover_on_start(&s, now, true).unwrap();
+        assert_eq!(report.interrupted, vec!["mo-r-3".to_string()]);
+        assert_eq!(s.get_lease("mo-r-3").unwrap().unwrap().state, "interrupted");
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn recovery_keeps_active_on_daemon_restart() {
+        let p = tmp_path();
+        let s = Store::open(&p).unwrap();
+        let now = now_unix();
+        let active = sample_lease("mo-r-4", "vd1", "active");
+        s.with_tx(|tx| {
+            Store::insert_lease_tx(tx, &active)?;
+            Ok(())
+        })
+        .unwrap();
+        let report = recover_on_start(&s, now, false).unwrap();
+        assert!(report.interrupted.is_empty());
+        assert_eq!(s.get_lease("mo-r-4").unwrap().unwrap().state, "active");
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn granted_with_dead_cdp_rolls_back() {
+        let p = tmp_path();
+        let s = Store::open(&p).unwrap();
+        let now = now_unix();
+        let mut g = sample_lease("mo-r-5", "vd1", "granted");
+        g.cdp_port = Some(59999);
+        s.with_tx(|tx| {
+            Store::insert_lease_tx(tx, &g)?;
+            Ok(())
+        })
+        .unwrap();
+        let report = recover_on_start(&s, now, false).unwrap();
+        assert_eq!(report.rolled_back, vec!["mo-r-5".to_string()]);
+        assert_eq!(s.get_lease("mo-r-5").unwrap().unwrap().state, "failed");
+        drop(s);
+        let _ = std::fs::remove_file(p);
     }
 }
