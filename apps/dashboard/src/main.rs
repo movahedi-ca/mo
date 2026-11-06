@@ -1,7 +1,15 @@
 // mo-dashboard: standalone fullscreen viewer for the MO dashboard.
 // Native GTK, no WebKit, no browser of any kind.
-// One borderless fullscreen window on :1. 1960s theme: warm cream,
+// One borderless fullscreen window. On :0 it IS the physical display
+// (native GTK window, no VNC, no Chrome frame). On :1 it is the same
+// window on the VNC display (fallback copy). 1960s theme: warm cream,
 // teal, burnt orange, brown, monospace type, retro MO face.
+//
+// On :0 the window hides itself while the kiosk view is a vd, so the
+// kiosk Chrome showing that vd comes forward; it shows itself again
+// when the view returns to main. The 3 second poll loop drives this
+// from the kiosk-target file, so the back button on the vd view also
+// brings it back. On :1 the window never hides.
 //
 // Live data: polls mo-daemon through its Unix socket every 3 seconds
 // (one "live" call: status + queue + leases + desktops). No page reload.
@@ -272,6 +280,7 @@ fn apply_css() {
 }
 
 struct Widgets {
+    window: gtk::Window,
     clock: gtk::Label,
     daemon: gtk::Label,
     battery_label: gtk::Label,
@@ -454,6 +463,7 @@ fn main() {
         desk_buttons.push((id.clone(), button, label));
     }
     let widgets = Widgets {
+        window: window.clone(),
         clock,
         daemon,
         battery_label,
@@ -541,6 +551,21 @@ fn refresh(w: &std::rc::Rc<std::cell::RefCell<Widgets>>) {
     let on = dpms_on();
     let w = w.borrow_mut();
 
+    // On :0 the dashboard is the physical display itself. While the
+    // kiosk view is a vd, hide so the kiosk Chrome showing that vd
+    // comes forward; when the view returns to main, show again. The
+    // poll loop drives this, so the back button on the vd view also
+    // brings it back. On :1 (the fallback copy) never hide.
+    let on_zero = std::env::var("DISPLAY").map(|d| d == ":0").unwrap_or(false);
+    if on_zero {
+        if viewing == "main-display" {
+            w.window.show_all();
+            w.window.present();
+        } else {
+            w.window.hide();
+        }
+    }
+
     // Reap a back window that exited on its own (back button clicked).
     // One borrow at a time: the check borrow must drop before the
     // clear borrow, or the RefCell panics (hit 2026-11-06 17:52).
@@ -548,7 +573,7 @@ fn refresh(w: &std::rc::Rc<std::cell::RefCell<Widgets>>) {
         .back_child
         .borrow_mut()
         .as_mut()
-        .map_or(false, |c| matches!(c.try_wait(), Ok(Some(_))));
+        .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
     if exited {
         *w.back_child.borrow_mut() = None;
     }

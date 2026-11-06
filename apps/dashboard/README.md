@@ -2,13 +2,23 @@
 
 Standalone fullscreen viewer for the MO resource assistant dashboard.
 Native GTK, no WebKit, no browser of any kind. One borderless
-fullscreen window on :1. No browser UI. No tabs. No address bar.
-No Chrome.
+fullscreen window on the PHYSICAL display :0. No browser UI. No tabs.
+No address bar. No Chrome. No VNC.
 
-## Status: LIVE on chromebook-vm since 2026-11-06 17:25 EST
+## Status: LIVE on :0 since 2026-11-06 18:16 EST (moved from :1)
 
 - Binary: `~/.local/bin/mo-dashboard` (573 KB, Rust, release build)
-- Window: fullscreen on :1, on top of the main Chrome (tabs untouched behind it)
+- Window: fullscreen native on :0, the physical panel. Chrome kiosk
+  runs underneath for vd viewing only, never for the dashboard.
+- The :0 move: Debian runs on bare metal (DMI Shyvana/Google),
+  Xorg :0 is the physical panel, :1 is TigerVNC. `DISPLAY=:0`
+  works from the VM shell (same ~/.Xauthority). Proven with a
+  trivial xterm on :0 first, then the app. Autostart is
+  `~/jobs/mirror-viewer.sh` via `mirror-display.service`. The old
+  :1 copy was stopped and its XFCE autostart entry disabled.
+- On :0 the window hides while the kiosk view is a vd (kiosk Chrome
+  comes forward) and shows itself again on BACK TO MAIN, driven by
+  the 3 s poll loop from `~/jobs/kiosk-target`. On :1 it never hid.
 - Live data: polls the daemon Unix socket `~/jobs/mo/mo.sock`
   (`{"cmd":"live"}`) every 3 s. Numbers move without a page reload.
   No network port. No HTTP.
@@ -24,8 +34,11 @@ No Chrome.
   the physical display :0 (eDP-1) through DPMS. :1 is TigerVNC
   and has no DPMS extension. `mo-cli display off` / `mo-cli
   display on` do the same from anywhere.
-- Autostart: `~/.config/autostart/mo-dashboard.desktop` (MO Dashboard)
-- Verified live: :1 screenshots show the dashboard edge to edge,
+- Autostart: `~/jobs/mirror-viewer.sh` via `mirror-display.service`
+  (xinit on :0). The old XFCE autostart entry
+  (`~/.config/autostart/mo-dashboard.desktop`) is disabled.
+- Verified live: :0 framebuffer screenshots (scrot, not VNC) show
+  the dashboard edge to edge, no Chrome frame, live numbers moving
   MO character top left, live numbers moving within seconds,
   tile click switching the kiosk view to vd1 and back, display
   off/on with live state from `xset -display :0 q`
@@ -47,8 +60,8 @@ is unused. It stays in the repo as history only.
 ## Run
 
 ```sh
-DISPLAY=:1 mo-dashboard &
-DISPLAY=:1 mo-dashboard --back   # small back-to-main window, on $DISPLAY
+DISPLAY=:0 mo-dashboard &
+DISPLAY=:0 mo-dashboard --back   # small back-to-main window, on $DISPLAY
 ```
 
 ## Kiosk scripts

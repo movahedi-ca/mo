@@ -89,11 +89,50 @@ is superseded: the app is the display now, no browser at all.
 
 ## Dashboard app (native GTK, no WebKit, no Chrome)
 
-`apps/dashboard/`, binary `~/.local/bin/mo-dashboard`, autostart
-`~/.config/autostart/mo-dashboard.desktop`. One borderless fullscreen
-window on :1. Rust, gtk 0.18 + cairo-rs 0.18 + serde + libc. The
-WebKit build (webkit2gtk 2.0.2) was replaced 2026-11-06 17:40 EST;
-the C fallback `mo-dashboard.c` was never compiled and is unused.
+`apps/dashboard/`, binary `~/.local/bin/mo-dashboard`. One borderless
+fullscreen window on the PHYSICAL display :0 (native GTK window,
+no VNC, no Chrome frame), since 2026-11-06 18:16 EST. Rust, gtk 0.18
++ cairo-rs 0.18 + serde + libc. The WebKit build (webkit2gtk 2.0.2)
+was replaced 2026-11-06 17:40 EST; the C fallback `mo-dashboard.c`
+was never compiled and is unused.
+
+The :0 move (2026-11-06 18:16 EST): the VM is Debian on bare metal
+(DMI Shyvana/Google, systemd-detect-virt none), Xorg :0 is the
+physical panel (eDP-1) and :1 is TigerVNC. A native window CAN open
+on :0 from the VM: `DISPLAY=:0` works from the shell (same
+~/.Xauthority), proven first with a trivial xterm on :0, then with
+the app itself. Autostart is `~/jobs/mirror-viewer.sh`, run by
+`mirror-display.service` (`xinit ... -- :0`): it launches
+mo-dashboard on :0 first, then the Chrome kiosk underneath (for vd
+viewing only), and the session lives as long as the dashboard; if
+Chrome dies while the dashboard is up, the script relaunches it.
+Backup: `~/jobs/mirror-viewer.sh.bak-20261106-1816`. The old :1 copy
+(PID 143435) was stopped after :0 was verified, and its XFCE
+autostart entry was disabled
+(`~/.config/autostart/mo-dashboard.desktop.disabled`). The :1 copy
+never hides; the :0 copy does (below).
+
+On :0 the window hides itself while the kiosk view is a vd, so the
+kiosk Chrome showing that vd comes forward; it shows itself again
+when the view returns to main. The 3 s poll loop drives this from
+`~/jobs/kiosk-target`, so the BACK TO MAIN button on the vd view
+also brings it back. Gated on `DISPLAY == ":0"` in `refresh()`.
+Verified end to end 2026-11-06 18:14 EST with real xdotool clicks
+on :0: vd1 tile click -> target 5903, app hidden, kiosk showed vd1;
+BACK TO MAIN click -> target 5902, app fullscreen again. The first
+frame after a switch is black for a few seconds (bridge restart +
+noVNC reconnect lag); the vd paints after ~10 s. A vd with no Chrome
+is DOWN and its tile is insensitive: warm it first
+(`vd-warm.sh 1`), a bare `vd-start.sh 1` leaves CDP dead and the
+tile unclickable. Evidence: `implementation/evidence/
+2026-11-06-dashboard/` (display0-native, display0-vd1,
+display0-back, display0-restart, display0-final). Startup transient:
+right after a mirror-display.service restart the xdotool forcing
+can raise the kiosk Chrome above the dashboard for a few seconds;
+the dashboard re-presents itself on the next 3 s poll tick and
+lands on top. The script launches the dashboard last so it lands
+on top deterministically. If it ever sticks, raise it with
+`DISPLAY=:0 xdotool search --name 'MO Dashboard' windowactivate`.
 
 Live data: polls `~/jobs/mo/mo.sock` with `{"cmd":"live"}` every 3 s
 (1 s timeouts). No page reload, no network port, no HTTP. Numbers
