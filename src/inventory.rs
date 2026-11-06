@@ -4,7 +4,7 @@
 //! Bridge pool read: HTTP GET 127.0.0.1:8899/health, 5s timeout, 2 retries.
 //! On failure the pool is unknown, never guessed.
 
-use crate::core::{now_unix, Battery, Inventory};
+use crate::core::{now_unix, Inventory};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
@@ -189,6 +189,6 @@ mod tests {
 
     #[test]
     fn battery_type_is_used() {
-        let _b: Option<Battery> = crate::battery::read_battery();
+        let _b = crate::battery::read_battery();
     }
 }

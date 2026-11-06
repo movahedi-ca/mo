@@ -4,7 +4,7 @@
 //! Heartbeat and reclaim land in TASK-009, in this module.
 
 use crate::core::{
-    new_lease_id, now_unix, unix_to_iso, Config, Grant, Inventory, Lease, LeaseRequest, MoError,
+    new_lease_id, unix_to_iso, Config, Grant, Inventory, Lease, LeaseRequest, MoError,
     QueuedRequest, Result,
 };
 use crate::store::Store;
@@ -55,6 +55,7 @@ pub fn desktop_binding(desktop: &str) -> (String, Option<i64>, Option<i64>, Opti
 /// `provision` starts the desktop and waits for CDP (up to 10s).
 /// `stop` stops a desktop after a failed provision.
 /// Both are closures so tests can inject failures without a live desktop.
+#[allow(clippy::too_many_arguments)]
 pub fn grant(
     store: &Store,
     req: &QueuedRequest,
@@ -521,7 +522,7 @@ pub fn lease_from_request(req: &LeaseRequest, desktop: &str, now: i64) -> Lease 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::LeaseRequest;
+    use crate::core::{now_unix, LeaseRequest};
 
     fn tmp_store() -> (Store, String) {
         let nanos = std::time::SystemTime::now()
@@ -887,7 +888,8 @@ mod tests {
 
     #[test]
     fn expiry_marks_expired() {
-        let (s, p, id, cfg, now) = granted_lease();
+        let (s, p, id, _cfg, now) = granted_lease();
+        let _ = _cfg;
         let expired = expire_leases(&s, now + 1801).unwrap();
         assert_eq!(expired, vec![id.clone()]);
         assert_eq!(s.get_lease(&id).unwrap().unwrap().state, "expired");

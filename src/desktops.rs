@@ -2,7 +2,7 @@
 //! V3 section 5.2. Fold safety checklist, 7 checks. :1 hard guard, E14.
 //! vd scripts are call targets only. MO never edits them.
 
-use crate::core::{now_unix, Config, Desktop, Inventory, MoError, Result};
+use crate::core::{Config, Desktop, Inventory, MoError, Result};
 use crate::store::Store;
 use std::net::TcpStream;
 use std::time::Duration;

@@ -155,6 +155,7 @@ impl Store {
     }
 
     /// Audit insert inside a transaction. One row per event.
+    #[allow(clippy::too_many_arguments)]
     pub fn audit_tx(
         tx: &Transaction<'_>,
         event: &str,
@@ -174,6 +175,7 @@ impl Store {
     }
 
     /// Audit insert outside a transaction.
+    #[allow(clippy::too_many_arguments)]
     pub fn audit(
         &self,
         event: &str,
