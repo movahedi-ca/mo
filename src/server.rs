@@ -22,6 +22,12 @@ pub struct Daemon {
     ncpu: i64,
     last_bypass_unix: std::sync::Mutex<i64>,
     last_prune_unix: std::sync::Mutex<i64>,
+    /// Single-flight lock for drain_queue. The tick thread, the
+    /// startup drain in main, and every request/release handler all
+    /// call drain_queue, and two concurrent drains granted the same
+    /// queued request twice (live host, 2026-11-06: one vd-chrome
+    /// request got two leases, vd1 and vd2, in the same second).
+    drain_lock: std::sync::Mutex<()>,
 }
 
 fn cpu_total() -> i64 {
@@ -109,6 +115,7 @@ impl Daemon {
             ncpu: cpu_total(),
             last_bypass_unix: std::sync::Mutex::new(0),
             last_prune_unix: std::sync::Mutex::new(0),
+            drain_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -225,6 +232,12 @@ impl Daemon {
     /// Refuse battery state stops the drain; Warn/Restrict skip the one
     /// blocked entry and the drain continues to the next fitting entry.
     pub fn drain_queue(&self) -> Result<()> {
+        // Patch 12: single-flight. Without this, two concurrent drains
+        // both list the same queued request and both grant it.
+        let _guard = self
+            .drain_lock
+            .lock()
+            .map_err(|_| MoError::e10("drain lock poisoned"))?;
         let now = now_unix();
         // Deferred in this pass only: battery-blocked or transiently
         // failed entries. Without this the loop re-grants a waiting
@@ -1300,6 +1313,37 @@ mod tests {
             .filter(|a| a.event == "skip" && a.job_id.as_deref() == Some("big"))
             .count();
         assert_eq!(skips, 1, "skip rows written twice");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Patch 12: two concurrent drains grant one queued request once.
+    /// At startup the tick thread and the main thread both drain; without
+    /// a single-flight lock both listed the same queued request and each
+    /// granted it (live host, 2026-11-06: one vd-chrome request got two
+    /// leases, vd1 and vd2, in the same second).
+    #[test]
+    fn concurrent_drains_grant_once() {
+        let (cfg, dir, _sock) = tmp_cfg();
+        let store = Arc::new(Store::open(&cfg.db_path).unwrap());
+        let daemon = Arc::new(Daemon::new(store.clone(), cfg, Arc::new(ChromebookAdapter)));
+        let req: LeaseRequest = serde_json::from_value(request_json()["request"].clone()).unwrap();
+        let caps = daemon.adapter.capabilities();
+        let outcome = crate::queue::submit(&store, &req, &caps, now_unix()).unwrap();
+        assert!(!outcome.duplicate);
+        assert_eq!(store.list_queued_requests().unwrap().len(), 1);
+        std::thread::scope(|s| {
+            let d1 = daemon.clone();
+            let d2 = daemon.clone();
+            let t1 = s.spawn(move || d1.drain_queue());
+            let t2 = s.spawn(move || d2.drain_queue());
+            t1.join().unwrap().unwrap();
+            t2.join().unwrap().unwrap();
+        });
+        let active = store.list_leases(&["active"]).unwrap();
+        assert_eq!(active.len(), 1, "one request granted twice");
+        let row = store.get_request(outcome.request_id).unwrap().unwrap();
+        assert_eq!(row.status, "granted");
+        assert_eq!(row.lease_id.as_deref(), Some(active[0].lease_id.as_str()));
         let _ = std::fs::remove_dir_all(dir);
     }
 
