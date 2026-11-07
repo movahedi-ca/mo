@@ -456,6 +456,26 @@ pub struct AuditEvent {
     pub created_unix: i64,
 }
 
+/// One measured-usage row (Step 1 of S1-for-MO). One row per lease
+/// that reached a terminal state, written when it ended. peak_rss_mb
+/// and cpu_time_s are null when neither the daemon nor the agent
+/// measured the lease; source names the evidence: "agent" (agent
+/// reported on release), "daemon" (MO sampled the Chrome tree),
+/// "daemon-partial" (daemon sampled, but the lease started before
+/// this daemon process, so the peak is a lower bound), "none".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseUsage {
+    pub lease_id: String,
+    pub agent_id: String,
+    pub job_id: String,
+    pub resource_class: String,
+    pub peak_rss_mb: Option<i64>,
+    pub cpu_time_s: Option<f64>,
+    pub duration_s: i64,
+    pub source: String,
+    pub recorded_unix: i64,
+}
+
 /// Config from env. V3 section 9.4. Paths are absolute, defaults under ~/jobs/mo.
 #[derive(Debug, Clone)]
 pub struct Config {

@@ -15,3 +15,4 @@ pub mod queue;
 pub mod sched;
 pub mod server;
 pub mod store;
+pub mod usage;

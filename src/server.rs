@@ -8,6 +8,7 @@ use crate::core::{
 };
 use crate::host::HostAdapter;
 use crate::store::Store;
+use crate::usage::{AgentUsage, RunningUsage};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -33,6 +34,16 @@ pub struct Daemon {
     /// time. Memory only: a restart resets the backoff, and the queue
     /// itself is the durable state.
     retry_state: std::sync::Mutex<HashMap<i64, DrainRetryState>>,
+    /// Step 1 of S1-for-MO: running usage peaks per active lease,
+    /// keyed by lease id. The tick samples each active Chrome lease's
+    /// process tree and keeps the max RSS / latest CPU time here.
+    /// The peak is taken out and written to lease_usage when the
+    /// lease ends. Memory only: a restart loses in-flight peaks, and
+    /// a lease that started before this daemon is recorded as
+    /// "daemon-partial" so the lower bound is visible, not silent.
+    usage_peaks: std::sync::Mutex<HashMap<String, RunningUsage>>,
+    /// Wall time this daemon process started, for the partial flag.
+    daemon_started_unix: i64,
 }
 
 /// FIX-006: drain backoff delays in seconds. Attempt 1 waits 30 s,
@@ -178,6 +189,8 @@ impl Daemon {
             last_prune_unix: std::sync::Mutex::new(0),
             drain_lock: std::sync::Mutex::new(()),
             retry_state: std::sync::Mutex::new(HashMap::new()),
+            usage_peaks: std::sync::Mutex::new(HashMap::new()),
+            daemon_started_unix: now_unix(),
         }
     }
 
@@ -185,18 +198,100 @@ impl Daemon {
     /// F05: capacity coming back is noticed here, not only when a new
     /// request arrives. Expired requests and leases, stale sweeps,
     /// reclaim, and the drain all run in this order, then the drain
-    /// grants whatever now fits.
+    /// grants whatever now fits. Step 1 of S1-for-MO: leases that end
+    /// here get their measured-usage row written right after the
+    /// transition, and active Chrome leases get their process trees
+    /// sampled for the running peak.
     pub fn tick(&self) -> Result<()> {
         let now = now_unix();
         let _ = crate::queue::expire_stale(&self.store, now);
-        let _ = crate::lease::expire_leases(&self.store, now);
-        let _ = crate::lease::expire_interrupted(&self.store, now);
+        let expired = crate::lease::expire_leases(&self.store, now).unwrap_or_default();
+        self.record_usage_for(&expired, now, None);
+        let expired_i = crate::lease::expire_interrupted(&self.store, now).unwrap_or_default();
+        self.record_usage_for(&expired_i, now, None);
         let _ = crate::lease::sweep_stale(&self.store, now, &self.cfg);
-        let _ = crate::lease::reclaim_all(&self.store, now, &self.cfg);
+        let reclaimed = crate::lease::reclaim_all(&self.store, now, &self.cfg).unwrap_or_default();
+        self.record_usage_for(&reclaimed, now, None);
+        self.sample_usage();
         self.drain_queue()?;
         self.check_bypass(now);
         self.prune_daily(now);
         Ok(())
+    }
+
+    /// Step 1 of S1-for-MO: sample the Chrome process tree of every
+    /// lease that holds a desktop, and keep the running peak in
+    /// memory. Only leases with a profile can be attributed (vd-chrome
+    /// and headless-chrome with a profile); a main-display lease shares
+    /// the :1 Chrome and a cpu-ram lease runs a process MO did not
+    /// start, so neither is sampled here. Never fails the tick: a
+    /// failed sample is skipped, never an error.
+    fn sample_usage(&self) {
+        let leases = match self.store.list_leases(&[
+            "reserving",
+            "granted",
+            "active",
+            "stale",
+            "extension_pending",
+            "interrupted",
+        ]) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let Ok(mut peaks) = self.usage_peaks.lock() else {
+            return;
+        };
+        for lease in leases {
+            let Some(profile) = lease.profile.as_deref() else {
+                continue;
+            };
+            let Some(sample) = crate::usage::sample_process_tree(profile) else {
+                continue;
+            };
+            let entry = peaks.entry(lease.lease_id).or_default();
+            crate::usage::merge_peak(entry, sample);
+        }
+    }
+
+    /// Step 1 of S1-for-MO: write the measured-usage row for each
+    /// lease id that just ended. Takes the running peak out of the
+    /// map and does one final sample of the lease's Chrome tree, so
+    /// the peak is current to the end, not up to one tick stale.
+    /// `agent` carries usage the agent reported on release, which
+    /// wins over the daemon-measured peak. A failure to record a row
+    /// is logged, never an error: the lease transition already
+    /// happened and must not be undone by a measurement failure.
+    fn record_usage_for(&self, lease_ids: &[String], now: i64, agent: Option<&AgentUsage>) {
+        for lease_id in lease_ids {
+            let lease = match self.store.get_lease(lease_id) {
+                Ok(Some(l)) => l,
+                _ => continue,
+            };
+            let mut daemon_peak = self
+                .usage_peaks
+                .lock()
+                .ok()
+                .and_then(|mut peaks| peaks.remove(lease_id));
+            if let Some(profile) = lease.profile.as_deref() {
+                if let Some(sample) = crate::usage::sample_process_tree(profile) {
+                    let entry = daemon_peak.get_or_insert(RunningUsage::default());
+                    crate::usage::merge_peak(entry, sample);
+                }
+            }
+            if let Err(e) = crate::usage::record_ended_lease(
+                &self.store,
+                &lease,
+                now,
+                agent,
+                daemon_peak.as_ref(),
+                self.daemon_started_unix,
+            ) {
+                eprintln!(
+                    "mo-daemon: usage record failed for {lease_id}: {}",
+                    e.message
+                );
+            }
+        }
     }
 
     /// DEFECT-003: a desktop that is up with no holding lease was started
@@ -627,9 +722,28 @@ impl Daemon {
             .get("idempotency_key")
             .and_then(|v| v.as_str())
             .ok_or_else(|| MoError::e01("idempotency_key is required"))?;
+        // Step 1 of S1-for-MO: a cancel that releases a live lease
+        // ends it, so its usage row is written here. The lease id
+        // is read before the cancel, because the cancel itself does
+        // not return it.
+        let lease_id = self
+            .store
+            .find_request_by_idempotency(agent_id, key)
+            .ok()
+            .flatten()
+            .and_then(|r| r.lease_id);
         let cancelled = crate::queue::cancel(&self.store, agent_id, key, now, &|d: &str| {
             crate::desktops::stop_desktop(d)
         })?;
+        if cancelled {
+            if let Some(id) = lease_id {
+                if let Ok(Some(l)) = self.store.get_lease(&id) {
+                    if l.state == "released" {
+                        self.record_usage_for(&[id], now, None);
+                    }
+                }
+            }
+        }
         Ok(json!({ "cancelled": cancelled, "status": "ok" }))
     }
 
@@ -704,11 +818,35 @@ impl Daemon {
             .get("lease_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| MoError::e01("lease_id is required"))?;
+        // Step 1 of S1-for-MO: the agent may report its own measured
+        // usage on release (cpu-ram and headless-chrome leases, whose
+        // process MO did not start). Both fields optional, both must
+        // be non-negative when present. A missing or empty usage is
+        // not an error: the row is still written, with source "none"
+        // or the daemon-measured peak.
+        let agent_usage = match msg.get("usage") {
+            Some(u) if u.is_object() => {
+                let peak = u.get("peak_rss_mb").and_then(|v| v.as_i64());
+                let cpu = u.get("cpu_time_s").and_then(|v| v.as_f64());
+                if peak.map(|p| p < 0).unwrap_or(false) {
+                    return Err(MoError::e01("peak_rss_mb must be >= 0"));
+                }
+                if cpu.map(|c| c < 0.0).unwrap_or(false) {
+                    return Err(MoError::e01("cpu_time_s must be >= 0"));
+                }
+                Some(AgentUsage {
+                    peak_rss_mb: peak,
+                    cpu_time_s: cpu,
+                })
+            }
+            _ => None,
+        };
         let stop = |d: &str| crate::desktops::stop_desktop(d);
         let released = crate::lease::release(&self.store, lease_id, now, &stop)?;
-        // F05: a release frees capacity, so drain right away. A drain
-        // error must not turn a good release into an error response.
         if released {
+            self.record_usage_for(&[lease_id.to_string()], now, agent_usage.as_ref());
+            // F05: a release frees capacity, so drain right away. A drain
+            // error must not turn a good release into an error response.
             let _ = self.drain_queue();
         }
         Ok(json!({

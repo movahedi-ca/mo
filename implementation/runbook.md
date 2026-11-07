@@ -39,6 +39,36 @@ Deployed daemon PID 166598, binary sha 443665b8. Suite 112 passed, 0 failed, 1 i
 - Harness: cb-job.sh uses a per-call mktemp output path (parallel calls no longer eat each other's stdout). Yahoo selector list lives at ~/workspace/chromebook-vm/yahoo-price-selectors.js, primary [data-testid='qsp-price'].
 - Regression: stress test 1 (10 agents) PASS, stress test 2 (15 agents) PASS. Both beat the old baselines. Details in implementation/state.yaml (fix_015, fix_016).
 
+## Step 1 usage measurement (S1-for-MO, deployed 2026-11-06)
+
+Measure only. No scheduling logic, budget, or guard changed. Schema v4.
+
+- Table `lease_usage`: one row per lease that ended (release, expiry,
+  reclaim, cancel). Columns: lease_id, agent_id, job_id,
+  resource_class, peak_rss_mb (null when unmeasured), cpu_time_s
+  (null when unmeasured), duration_s, source, recorded_unix.
+  Source: "agent" (agent reported on release), "daemon" (MO sampled
+  the Chrome tree), "daemon-partial" (daemon sampled, but the lease
+  started before this daemon process, so the peak is a lower bound),
+  "none" (neither measured; row still written, with nulls).
+- vd-chrome: daemon samples the Chrome process tree by profile
+  (/proc, comm-first then cmdline match) on every 10 s tick and once
+  more at the lease end. Peak RSS is the max over samples; CPU time
+  is the latest cumulative total. RSS sums resident pages per
+  process, so shared pages count once per process: a conservative
+  overestimate, the safe direction for a budget.
+- cpu-ram / headless-chrome: MO did not start the process, so the
+  agent reports on release: `mo-cli release --lease <id>
+  --peak-rss-mb <MB> --cpu-time-s <SEC>`. Both flags optional.
+  Missing usage never fails the release.
+- main-display: shares the :1 Chrome, cannot be attributed. Row is
+  source "none" unless the agent reports.
+- Verify rows: `sqlite3 ~/jobs/mo/mo.db "SELECT lease_id,
+  resource_class, peak_rss_mb, cpu_time_s, duration_s, source FROM
+  lease_usage ORDER BY recorded_unix DESC LIMIT 10;"`
+- A measurement failure never breaks a lease: sampling errors are
+  skipped, a failed usage insert is logged, the transition stands.
+
 ## Daily checks
 
 ```bash
@@ -334,8 +364,8 @@ after the live deploy passes: v0.1.0 on 16e44943 (2026-11-06).
 - TEST-020 ARM64: blocked. No aarch64 cross linker on the build host or the VM.
 - README on remote main was rewritten by another session during deploy
   (d8ffea0c, 0f3ed2c7, 2026-11-06 16:46-16:48 EST). Kept as is. Synced locally.
-  It claims 94 tests. The count is 112 after the fix plan (2026-11-06).
-  Fix the number on the next README touch.
+  It claims 94 tests. The count is 123 after the Step 1 usage measurement
+  (2026-11-06).
 - No Oracle VM exists. No Oracle adapter test has run.
 - TEST-055 should count vd-profile Chrome processes, not total chrome_count.
   chrome_count counts ANY Chrome on the VM (including one-shot headless runs),

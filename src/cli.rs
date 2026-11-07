@@ -36,6 +36,15 @@ enum Cmd {
     Release {
         #[arg(long)]
         lease: String,
+        /// Peak RSS in MB the agent measured for its own process.
+        /// Optional. Step 1 of S1-for-MO: how cpu-ram and
+        /// headless-chrome leases report usage MO cannot sample.
+        #[arg(long)]
+        peak_rss_mb: Option<i64>,
+        /// CPU time in seconds the agent measured for its own process.
+        /// Optional.
+        #[arg(long)]
+        cpu_time_s: Option<f64>,
     },
     /// Show daemon status.
     Status,
@@ -133,7 +142,20 @@ pub fn run() -> Result<()> {
         Cmd::Extend { lease, minutes } => {
             json!({ "cmd": "extend", "lease_id": lease, "minutes": minutes })
         }
-        Cmd::Release { lease } => json!({ "cmd": "release", "lease_id": lease }),
+        Cmd::Release {
+            lease,
+            peak_rss_mb,
+            cpu_time_s,
+        } => {
+            let mut msg = json!({ "cmd": "release", "lease_id": lease });
+            if peak_rss_mb.is_some() || cpu_time_s.is_some() {
+                msg["usage"] = json!({
+                    "peak_rss_mb": peak_rss_mb,
+                    "cpu_time_s": cpu_time_s,
+                });
+            }
+            msg
+        }
         Cmd::Status => json!({ "cmd": "status" }),
         Cmd::Queue => json!({ "cmd": "queue" }),
         Cmd::Leases => json!({ "cmd": "leases" }),

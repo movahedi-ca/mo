@@ -3,11 +3,11 @@
 //! Schema version 1. One transaction covers queue, lease, reservation, audit.
 //! Store owns all durable state. No module writes state directly.
 
-use crate::core::{AuditEvent, Lease, MoError, QueuedRequest, Result};
+use crate::core::{AuditEvent, Lease, LeaseUsage, MoError, QueuedRequest, Result};
 use rusqlite::{params, Connection, Transaction};
 use std::sync::Mutex;
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -109,10 +109,54 @@ CREATE TABLE IF NOT EXISTS inventory_snapshots (
   battery_state TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_taken ON inventory_snapshots(taken_unix);
+-- Step 1 of S1-for-MO: one measured-usage row per lease that ended.
+-- peak_rss_mb / cpu_time_s are null when neither the daemon nor the
+-- agent measured the lease; source names the evidence (agent,
+-- daemon, daemon-partial, none). One row per lease, ever.
+CREATE TABLE IF NOT EXISTS lease_usage (
+  lease_id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  resource_class TEXT NOT NULL,
+  peak_rss_mb INTEGER,
+  cpu_time_s REAL,
+  duration_s INTEGER NOT NULL,
+  source TEXT NOT NULL,
+  recorded_unix INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_recorded ON lease_usage(recorded_unix);
+CREATE INDEX IF NOT EXISTS idx_usage_class ON lease_usage(resource_class);
 ";
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+/// Migrate a v3 database to v4. Idempotent: CREATE TABLE IF NOT
+/// EXISTS and CREATE INDEX IF NOT EXISTS. Adds the lease_usage
+/// table (Step 1 of S1-for-MO). No existing table is touched and
+/// no lease history is lost.
+fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS lease_usage (
+          lease_id TEXT PRIMARY KEY,
+          agent_id TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          resource_class TEXT NOT NULL,
+          peak_rss_mb INTEGER,
+          cpu_time_s REAL,
+          duration_s INTEGER NOT NULL,
+          source TEXT NOT NULL,
+          recorded_unix INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_usage_recorded ON lease_usage(recorded_unix);
+        CREATE INDEX IF NOT EXISTS idx_usage_class ON lease_usage(resource_class);",
+    )?;
+    conn.execute(
+        "UPDATE schema_meta SET value='4' WHERE key='schema_version'",
+        [],
+    )?;
+    Ok(())
 }
 
 /// Migrate a v2 database to v3. Idempotent: every step checks first.
@@ -252,8 +296,12 @@ impl Store {
                 if n == 1 {
                     migrate_v1_to_v2(&conn)?;
                     migrate_v2_to_v3(&conn)?;
+                    migrate_v3_to_v4(&conn)?;
                 } else if n == 2 {
                     migrate_v2_to_v3(&conn)?;
+                    migrate_v3_to_v4(&conn)?;
+                } else if n == 3 {
+                    migrate_v3_to_v4(&conn)?;
                 }
             }
         }
@@ -661,6 +709,70 @@ impl Store {
             .map(|s| s as &dyn rusqlite::types::ToSql)
             .collect();
         let rows = stmt.query_map(&params[..], row_to_lease)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Record one measured-usage row. INSERT OR IGNORE: one row per
+    /// lease, ever. Returns true when a row was inserted, false when
+    /// a row for this lease already exists.
+    pub fn record_lease_usage(&self, row: &LeaseUsage) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        let n = conn.execute(
+            "INSERT OR IGNORE INTO lease_usage(lease_id, agent_id, job_id, resource_class,
+             peak_rss_mb, cpu_time_s, duration_s, source, recorded_unix)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                row.lease_id,
+                row.agent_id,
+                row.job_id,
+                row.resource_class,
+                row.peak_rss_mb,
+                row.cpu_time_s,
+                row.duration_s,
+                row.source,
+                row.recorded_unix,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn get_lease_usage(&self, lease_id: &str) -> Result<Option<LeaseUsage>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT lease_id, agent_id, job_id, resource_class, peak_rss_mb,
+             cpu_time_s, duration_s, source, recorded_unix
+             FROM lease_usage WHERE lease_id=?1",
+        )?;
+        let mut rows = stmt.query(params![lease_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_usage(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Newest usage rows first, for verification and for Step 2.
+    pub fn list_lease_usage(&self, limit: i64) -> Result<Vec<LeaseUsage>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MoError::e10("store lock poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT lease_id, agent_id, job_id, resource_class, peak_rss_mb,
+             cpu_time_s, duration_s, source, recorded_unix
+             FROM lease_usage ORDER BY recorded_unix DESC, lease_id ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], row_to_usage)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -1080,6 +1192,20 @@ fn row_to_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedRequest> {
     })
 }
 
+fn row_to_usage(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseUsage> {
+    Ok(LeaseUsage {
+        lease_id: row.get(0)?,
+        agent_id: row.get(1)?,
+        job_id: row.get(2)?,
+        resource_class: row.get(3)?,
+        peak_rss_mb: row.get(4)?,
+        cpu_time_s: row.get(5)?,
+        duration_s: row.get(6)?,
+        source: row.get(7)?,
+        recorded_unix: row.get(8)?,
+    })
+}
+
 fn row_to_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
     Ok(Lease {
         lease_id: row.get(0)?,
@@ -1216,9 +1342,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // v1 -> v2 -> v3 chain: version lands on 3, and the migrated
+        // v1 -> v2 -> v3 -> v4 chain: version lands on 4, and the migrated
         // row gets the safe started_desktop default 0.
-        assert_eq!(v, "3");
+        assert_eq!(v, "4");
         let old = s.get_lease("mo-old-1").unwrap().unwrap();
         assert_eq!(old.last_heartbeat_unix, 1200);
         assert_eq!(old.started_desktop, 0);
@@ -1333,6 +1459,109 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.code, "E10");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn lease_usage_round_trip_and_one_row_per_lease() {
+        let p = tmp_path();
+        let s = Store::open(&p).unwrap();
+        let row = LeaseUsage {
+            lease_id: "mo-u-1".to_string(),
+            agent_id: "scout".to_string(),
+            job_id: "j1".to_string(),
+            resource_class: "vd-chrome".to_string(),
+            peak_rss_mb: Some(812),
+            cpu_time_s: Some(12.5),
+            duration_s: 120,
+            source: "daemon".to_string(),
+            recorded_unix: now_unix(),
+        };
+        assert!(s.record_lease_usage(&row).unwrap());
+        // Second insert for the same lease is a no-op.
+        assert!(!s.record_lease_usage(&row).unwrap());
+        let got = s.get_lease_usage("mo-u-1").unwrap().unwrap();
+        assert_eq!(got.peak_rss_mb, Some(812));
+        assert_eq!(got.cpu_time_s, Some(12.5));
+        assert_eq!(got.source, "daemon");
+        assert_eq!(got.duration_s, 120);
+        // Nulls round-trip for an unmeasured lease.
+        let none_row = LeaseUsage {
+            lease_id: "mo-u-2".to_string(),
+            agent_id: "scout".to_string(),
+            job_id: "j1".to_string(),
+            resource_class: "cpu-ram".to_string(),
+            peak_rss_mb: None,
+            cpu_time_s: None,
+            duration_s: 60,
+            source: "none".to_string(),
+            recorded_unix: now_unix(),
+        };
+        assert!(s.record_lease_usage(&none_row).unwrap());
+        let got2 = s.get_lease_usage("mo-u-2").unwrap().unwrap();
+        assert_eq!(got2.peak_rss_mb, None);
+        assert_eq!(got2.source, "none");
+        assert_eq!(s.list_lease_usage(10).unwrap().len(), 2);
+        assert!(s.get_lease_usage("mo-nope").unwrap().is_none());
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn migrate_v3_to_v4_keeps_history_and_adds_usage() {
+        // Build a v3 database by hand: schema_meta says 3, the
+        // leases table is the v3 shape, one lease row, no
+        // lease_usage table. Open must migrate to 4, keep the
+        // lease, and make lease_usage writable.
+        let p = tmp_path();
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(
+                "CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO schema_meta VALUES('schema_version','3');
+                 CREATE TABLE leases(lease_id TEXT PRIMARY KEY, agent_id TEXT, job_id TEXT,
+                   resource_class TEXT, desktop TEXT, display TEXT, cdp_port INTEGER,
+                   vnc_port INTEGER, profile TEXT, cpu_cores INTEGER, mem_mb INTEGER,
+                   state TEXT, start_unix INTEGER, end_unix INTEGER, heartbeat_due_unix INTEGER,
+                   heartbeat_misses INTEGER, extensions INTEGER, last_heartbeat_unix INTEGER,
+                   created_unix INTEGER, started_desktop INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO leases VALUES('mo-old-3','a','j','vd-chrome','vd1',':2',9333,
+                   5903,'/tmp/chrome-vd1',1,512,'released',1000,2800,1300,0,0,0,1000,0);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&p).unwrap();
+        let c = Connection::open(&p).unwrap();
+        let v: String = c
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, "4");
+        // The v3 lease row survived the migration.
+        let old = s.get_lease("mo-old-3").unwrap().unwrap();
+        assert_eq!(old.state, "released");
+        assert_eq!(old.started_desktop, 0);
+        // lease_usage exists and accepts a row.
+        let row = LeaseUsage {
+            lease_id: "mo-old-3".to_string(),
+            agent_id: "a".to_string(),
+            job_id: "j".to_string(),
+            resource_class: "vd-chrome".to_string(),
+            peak_rss_mb: Some(700),
+            cpu_time_s: Some(9.0),
+            duration_s: 1800,
+            source: "daemon".to_string(),
+            recorded_unix: now_unix(),
+        };
+        assert!(s.record_lease_usage(&row).unwrap());
+        // Re-opening a v4 DB is a no-op: version stays 4.
+        drop(s);
+        let s2 = Store::open(&p).unwrap();
+        assert!(s2.get_lease_usage("mo-old-3").unwrap().is_some());
+        drop(s2);
         let _ = std::fs::remove_file(p);
     }
 

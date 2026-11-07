@@ -704,8 +704,11 @@ pub fn reclaim_check(
 
 /// Reclaim every STALE or EXPIRED lease: build the probe from live
 /// desktop state and run reclaim_check on each. Used by the tick.
-pub fn reclaim_all(store: &Store, now: i64, cfg: &Config) -> Result<()> {
+/// Returns the lease ids that were released, so the caller can
+/// record their measured usage.
+pub fn reclaim_all(store: &Store, now: i64, cfg: &Config) -> Result<Vec<String>> {
     let stale = store.list_leases(&["stale", "expired"])?;
+    let mut released = Vec::new();
     for lease in stale {
         let probe = ReclaimProbe {
             cdp_ok: lease.cdp_port.map(crate::desktops::cdp_ok).unwrap_or(false),
@@ -720,9 +723,13 @@ pub fn reclaim_all(store: &Store, now: i64, cfg: &Config) -> Result<()> {
                 .map(|p| !crate::desktops::profile_lock_free(p))
                 .unwrap_or(false),
         };
-        let _ = reclaim_check(store, &lease.lease_id, now, cfg, &probe);
+        if let Ok(ReclaimOutcome::Released) =
+            reclaim_check(store, &lease.lease_id, now, cfg, &probe)
+        {
+            released.push(lease.lease_id);
+        }
     }
-    Ok(())
+    Ok(released)
 }
 
 /// Build a Lease row from a LeaseRequest for direct use in tests.
