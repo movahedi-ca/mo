@@ -12,7 +12,7 @@ cargo build --release
 cargo test
 ```
 
-Version: **0.1.0** · License: **MIT** · MSRV: **1.89**
+Version: **0.1.0** · License: **PolyForm Noncommercial 1.0.0** · MSRV: **1.89**
 
 ---
 
@@ -538,7 +538,7 @@ Internal implementation notes, ADRs, and the task ledger live under `implementat
 
 ## License
 
-MIT License. See the `license` field in `Cargo.toml` and the repository license file if present.
+PolyForm Noncommercial License 1.0.0. Free for personal and noncommercial use. Commercial use requires a separate license. See LICENSE.
 
 ---
 
