@@ -162,13 +162,81 @@ pub fn queue_position(store: &Store, request_id: i64) -> Result<i64> {
 }
 
 /// Cancel a queued request. Idempotent: already cancelled returns ok.
-pub fn cancel(store: &Store, agent_id: &str, idempotency_key: &str, now: i64) -> Result<bool> {
+/// FIX-009: the lease is looked up first. A live lease is released
+/// cleanly (recorded as a release) and the request is then cancelled.
+/// A reserving lease is mid-transition and is never touched: it
+/// resolves to granted or failed on its own, in a transaction, and
+/// the cancel is refused. A released, failed, or expired lease is
+/// already gone, so the cancel proceeds normally.
+pub fn cancel(
+    store: &Store,
+    agent_id: &str,
+    idempotency_key: &str,
+    now: i64,
+    stop: &dyn Fn(&str) -> Result<()>,
+) -> Result<bool> {
     let found = store.find_request_by_idempotency(agent_id, idempotency_key)?;
     match found {
         None => Err(MoError::e01(format!(
             "no request for agent {agent_id} with that idempotency_key"
         ))),
         Some(r) => {
+            if let Some(lease_id) = &r.lease_id {
+                if let Some(lease) = store.get_lease(lease_id)? {
+                    match lease.state.as_str() {
+                        "released" | "failed" | "expired" => {}
+                        "reserving" => {
+                            store.audit(
+                                "cancel_blocked",
+                                Some(agent_id),
+                                Some(&r.job_id),
+                                Some(lease_id),
+                                Some(&lease.desktop),
+                                &format!(
+                                    "request {} has lease {} in state reserving: lease left in place",
+                                    r.id, lease_id
+                                ),
+                                now,
+                            )?;
+                            return Ok(false);
+                        }
+                        _ => match crate::lease::release(store, lease_id, now, stop) {
+                            Ok(true) => {
+                                store.audit(
+                                    "cancel",
+                                    Some(agent_id),
+                                    Some(&r.job_id),
+                                    Some(lease_id),
+                                    Some(&lease.desktop),
+                                    &format!(
+                                        "request {} cancelled, lease {} released",
+                                        r.id, lease_id
+                                    ),
+                                    now,
+                                )?;
+                                store.update_request_status(r.id, "cancelled")?;
+                                return Ok(true);
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                store.audit(
+                                    "cancel_blocked",
+                                    Some(agent_id),
+                                    Some(&r.job_id),
+                                    Some(lease_id),
+                                    Some(&lease.desktop),
+                                    &format!(
+                                        "request {} lease {} release failed ({}): lease left in place",
+                                        r.id, lease_id, e.message
+                                    ),
+                                    now,
+                                )?;
+                                return Ok(false);
+                            }
+                        },
+                    }
+                }
+            }
             if r.status == "cancelled" {
                 return Ok(false);
             }
@@ -322,18 +390,71 @@ mod tests {
         let _ = std::fs::remove_file(p);
     }
 
+    fn ok_stop(_d: &str) -> Result<()> {
+        Ok(())
+    }
+
     #[test]
     fn cancel_and_expire() {
         let (s, p) = tmp_store();
         let r = req();
         submit(&s, &r, &caps(), now_unix()).unwrap();
-        assert!(cancel(&s, "scout", &r.idempotency_key, now_unix()).unwrap());
-        assert!(!cancel(&s, "scout", &r.idempotency_key, now_unix()).unwrap());
+        assert!(cancel(&s, "scout", &r.idempotency_key, now_unix(), &ok_stop).unwrap());
+        assert!(!cancel(&s, "scout", &r.idempotency_key, now_unix(), &ok_stop).unwrap());
         let mut r2 = req();
         r2.job_id = "old".to_string();
         r2.idempotency_key = uuid::Uuid::new_v4().to_string();
         submit(&s, &r2, &caps(), now_unix() - QUEUE_TTL_SECS - 1).unwrap();
         assert_eq!(expire_stale(&s, now_unix()).unwrap(), 1);
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// FIX-009/TEST-048: cancel after a lease exists releases the live
+    /// lease cleanly and records it, and never touches a reserving
+    /// lease: the reserving cancel is refused and the lease is left
+    /// in place to resolve on its own.
+    #[test]
+    fn cancel_releases_live_lease_and_refuses_reserving() {
+        let (s, p) = tmp_store();
+        let r = req();
+        let outcome = submit(&s, &r, &caps(), now_unix()).unwrap();
+        let lease = crate::lease::lease_from_request(&r, "vd1", now_unix());
+        s.with_tx(|tx| {
+            Store::insert_lease_tx(tx, &lease)?;
+            Ok(())
+        })
+        .unwrap();
+        s.set_request_lease(outcome.request_id, &lease.lease_id)
+            .unwrap();
+        s.update_request_status(outcome.request_id, "granted")
+            .unwrap();
+        assert!(cancel(&s, "scout", &r.idempotency_key, now_unix(), &ok_stop).unwrap());
+        let row = s.get_request(outcome.request_id).unwrap().unwrap();
+        assert_eq!(row.status, "cancelled");
+        assert_eq!(
+            s.get_lease(&lease.lease_id).unwrap().unwrap().state,
+            "released"
+        );
+        // Reserving lease: cancel refused, lease left in place.
+        let r2 = req();
+        let outcome2 = submit(&s, &r2, &caps(), now_unix()).unwrap();
+        let mut reserving = crate::lease::lease_from_request(&r2, "vd2", now_unix());
+        reserving.state = "reserving".to_string();
+        s.with_tx(|tx| {
+            Store::insert_lease_tx(tx, &reserving)?;
+            Ok(())
+        })
+        .unwrap();
+        s.set_request_lease(outcome2.request_id, &reserving.lease_id)
+            .unwrap();
+        assert!(!cancel(&s, "scout", &r2.idempotency_key, now_unix(), &ok_stop).unwrap());
+        assert_eq!(
+            s.get_lease(&reserving.lease_id).unwrap().unwrap().state,
+            "reserving"
+        );
+        let row2 = s.get_request(outcome2.request_id).unwrap().unwrap();
+        assert_ne!(row2.status, "cancelled");
         drop(s);
         let _ = std::fs::remove_file(p);
     }

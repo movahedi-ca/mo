@@ -57,7 +57,7 @@ Explicit non-goals: no network exposure, no multi-host coordination, no LLM, no 
 | Version | 0.1.0 |
 | Maturity | Functional core complete; used on chromebook-vm and generic hosts |
 | Platforms | Linux (x86_64 primary; aarch64 cross-build currently blocked on missing linker) |
-| Tests | 94 unit tests passing (as of 2026-11-06 fix run) |
+| Tests | 112 unit tests passing, 1 ignored (as of 2026-11-06 fix plan) |
 | Clippy / fmt | Zero warnings, clean |
 | Known limitations | See [Limitations](#limitations) |
 
@@ -453,7 +453,7 @@ Release profile (from `Cargo.toml`):
 cargo test --release
 ```
 
-As of the 2026-11-06 architecture-review fix run the library reports **94 passed, 0 failed**. Clippy is clean and `cargo fmt --check` is clean.
+As of the 2026-11-06 fix plan the library reports **112 passed, 0 failed, 1 ignored**. Clippy is clean and `cargo fmt --check` is clean.
 
 Additional evidence (benchmarks, adversarial results, defect tracking) lives under `implementation/`. Those documents record measurements on a specific host and are not claimed as universal performance guarantees.
 

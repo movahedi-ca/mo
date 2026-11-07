@@ -1,5 +1,5 @@
 //! Scheduler: fit-first with head-of-line skip. V3 section 5.2, ADR-006.
-//! Order: class, then deadline, then score with aging.
+//! Order: score, then arrival within class, then deadline.
 //! Score = class weight + wait minutes / 10. P0 100, P1 10, P2 0.
 //! P2 reaches P1 after 100 minutes. Head keeps its position when skipped.
 //! A skip is audited by the caller.
@@ -61,8 +61,9 @@ pub fn fits(req: &QueuedRequest, free: &FreeCapacity) -> Option<String> {
     None
 }
 
-/// Plan the queue: sorted by class, deadline, score; each entry marked fit.
-/// The caller grants the first fitting entry and audits the skips before it.
+/// Plan the queue: sorted by score, arrival within class, deadline;
+/// each entry marked fit. The caller grants the first fitting entry
+/// and audits the skips before it.
 pub fn plan(requests: &[QueuedRequest], free: &FreeCapacity, now: i64) -> Vec<ScheduleEntry> {
     let mut reqs: Vec<&QueuedRequest> = requests.iter().collect();
     // F10: sort by score first, so aging is real. The score already
@@ -70,23 +71,27 @@ pub fn plan(requests: &[QueuedRequest], free: &FreeCapacity, now: i64) -> Vec<Sc
     // a fresh P1 sit ahead of a P2 that waited 100 minutes forever.
     // PriorityClass has no derived Ord on purpose; nothing here may
     // compare classes directly.
+    // FIX-008: FIFO within a priority class. Equal scores mean the
+    // same class and similar wait, so arrival order decides before
+    // deadline: a later request with an earlier deadline never jumps
+    // an earlier request of the same class.
     reqs.sort_by(|a, b| {
         let score_ord = score(b, now).cmp(&score(a, now));
         if score_ord != std::cmp::Ordering::Equal {
             return score_ord;
         }
+        let created_ord = a.created_unix.cmp(&b.created_unix);
+        if created_ord != std::cmp::Ordering::Equal {
+            return created_ord;
+        }
         let da = a.deadline.as_deref().and_then(iso_to_unix);
         let db = b.deadline.as_deref().and_then(iso_to_unix);
-        let deadline_ord = match (da, db) {
+        match (da, db) {
             (Some(x), Some(y)) => x.cmp(&y),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
-        };
-        if deadline_ord != std::cmp::Ordering::Equal {
-            return deadline_ord;
         }
-        a.created_unix.cmp(&b.created_unix)
     });
     reqs.into_iter()
         .map(|r| {
@@ -229,5 +234,41 @@ mod tests {
             ..free()
         };
         assert!(fits(&r, &known).is_none());
+    }
+
+    /// FIX-008/TEST-047: FIFO within a priority class. Grants follow
+    /// arrival order; a non-fitting head is a recorded skip, and the
+    /// earliest fitting request is next. A later request is never
+    /// granted while an earlier request of the same class fits.
+    #[test]
+    fn fifo_within_priority_grants_earliest_first() {
+        let now = now_unix();
+        let a = req("a-first", "P1", now, 0);
+        let b = req("b-second", "P1", now + 60, 0);
+        let c = req("c-third", "P1", now + 120, 0);
+        let p1 = plan(&[c.clone(), a.clone(), b.clone()], &free(), now);
+        assert_eq!(p1[0].request.job_id, "a-first");
+        assert_eq!(p1[1].request.job_id, "b-second");
+        assert_eq!(p1[2].request.job_id, "c-third");
+        assert_eq!(
+            first_fitting(&p1).unwrap().request.job_id,
+            "a-first",
+            "earliest fitting request of the class grants first"
+        );
+        // Head does not fit (2 desktops, 1 free): it is the recorded
+        // skip, and the next fitting request is B.
+        let tight = FreeCapacity {
+            desktops: 1,
+            ..free()
+        };
+        let head_big = req("a-big", "P1", now, 2);
+        let p2 = plan(&[b.clone(), head_big, c.clone()], &tight, now);
+        assert_eq!(p2[0].request.job_id, "a-big");
+        assert!(!p2[0].fits);
+        assert!(p2[0].skip_reason.is_some());
+        let skipped = skipped_before(&p2);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].request.job_id, "a-big");
+        assert_eq!(first_fitting(&p2).unwrap().request.job_id, "b-second");
     }
 }

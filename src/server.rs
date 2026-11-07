@@ -9,7 +9,7 @@ use crate::core::{
 use crate::host::HostAdapter;
 use crate::store::Store;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -28,6 +28,67 @@ pub struct Daemon {
     /// queued request twice (live host, 2026-11-06: one vd-chrome
     /// request got two leases, vd1 and vd2, in the same second).
     drain_lock: std::sync::Mutex<()>,
+    /// FIX-006/007: per-request drain retry state. Attempts, the last
+    /// error code, consecutive identical errors, and the next retry
+    /// time. Memory only: a restart resets the backoff, and the queue
+    /// itself is the durable state.
+    retry_state: std::sync::Mutex<HashMap<i64, DrainRetryState>>,
+}
+
+/// FIX-006: drain backoff delays in seconds. Attempt 1 waits 30 s,
+/// attempt 2 waits 60 s, attempt 3 waits 120 s, attempt 4 waits 240 s.
+/// After the 4th retry (5th failed attempt) the request is marked failed.
+pub const DRAIN_BACKOFF_SECS: [i64; 4] = [30, 60, 120, 240];
+/// FIX-006: max retries after the first failure.
+pub const DRAIN_MAX_RETRIES: i64 = 4;
+/// FIX-007: consecutive identical error codes that trip the breaker.
+pub const CIRCUIT_BREAKER_THRESHOLD: i64 = 3;
+
+#[derive(Debug, Clone, Default)]
+struct DrainRetryState {
+    attempts: i64,
+    consecutive_same: i64,
+    last_code: Option<String>,
+    next_retry_unix: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainRetryDecision {
+    RetryAt(i64),
+    FailCap,
+    FailBreaker,
+}
+
+/// FIX-006/007: record one failed drain attempt for a request.
+/// Returns the decision and the attempt count. The breaker trips
+/// first: 3 consecutive identical error codes stop retrying. Then
+/// the cap: the 5th failed attempt (initial + 4 retries) fails the
+/// request. Otherwise the next retry time follows the backoff
+/// schedule, 30 s, 60 s, 120 s, 240 s.
+fn record_drain_failure(
+    state: &mut DrainRetryState,
+    code: &str,
+    now: i64,
+) -> (DrainRetryDecision, i64) {
+    state.attempts += 1;
+    if state.last_code.as_deref() == Some(code) {
+        state.consecutive_same += 1;
+    } else {
+        state.consecutive_same = 1;
+        state.last_code = Some(code.to_string());
+    }
+    if state.consecutive_same >= CIRCUIT_BREAKER_THRESHOLD {
+        return (DrainRetryDecision::FailBreaker, state.attempts);
+    }
+    if state.attempts > DRAIN_MAX_RETRIES {
+        return (DrainRetryDecision::FailCap, state.attempts);
+    }
+    let delay = DRAIN_BACKOFF_SECS[(state.attempts - 1) as usize];
+    state.next_retry_unix = now + delay;
+    (
+        DrainRetryDecision::RetryAt(state.next_retry_unix),
+        state.attempts,
+    )
 }
 
 fn cpu_total() -> i64 {
@@ -116,6 +177,7 @@ impl Daemon {
             last_bypass_unix: std::sync::Mutex::new(0),
             last_prune_unix: std::sync::Mutex::new(0),
             drain_lock: std::sync::Mutex::new(()),
+            retry_state: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -246,6 +308,20 @@ impl Daemon {
         loop {
             let mut queued = self.store.list_queued_requests()?;
             queued.retain(|r| !deferred.contains(&r.id));
+            // FIX-006: a request inside its backoff window is not
+            // attempted again until its next retry time.
+            {
+                let retry = self
+                    .retry_state
+                    .lock()
+                    .map_err(|_| MoError::e10("retry state lock poisoned"))?;
+                queued.retain(|r| {
+                    retry
+                        .get(&r.id)
+                        .map(|s| s.next_retry_unix <= now)
+                        .unwrap_or(true)
+                });
+            }
             if queued.is_empty() {
                 return Ok(());
             }
@@ -263,14 +339,16 @@ impl Daemon {
             let caps = self.adapter.capabilities();
             let free = free_capacity(&self.store, &inv, &self.cfg, &caps, self.ncpu)?;
             let plan = crate::sched::plan(&queued, &free, now);
-            for skipped in crate::sched::skipped_before(&plan) {
+            // FIX-008: every non-fitting entry is a recorded fit skip,
+            // not only the ones ahead of the first fitting entry.
+            for entry in plan.iter().filter(|e| !e.fits) {
                 let reason = format!(
                     "head-of-line skip: {}",
-                    skipped.skip_reason.clone().unwrap_or_default()
+                    entry.skip_reason.clone().unwrap_or_default()
                 );
                 self.audit_skip_coalesced(
-                    &skipped.request.agent_id,
-                    &skipped.request.job_id,
+                    &entry.request.agent_id,
+                    &entry.request.job_id,
                     &reason,
                     now,
                 );
@@ -326,6 +404,19 @@ impl Daemon {
                 Ok(g) => {
                     self.store.update_request_status(req.id, "granted")?;
                     self.store.set_request_lease(req.id, &g.lease_id)?;
+                    if let Ok(mut retry) = self.retry_state.lock() {
+                        retry.remove(&req.id);
+                    }
+                    // FIX-008: log each grant with its queue position.
+                    let pos = plan
+                        .iter()
+                        .position(|e| e.request.id == req.id)
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    eprintln!(
+                        "mo-daemon: granted request {} queue position {pos} lease {}",
+                        req.id, g.lease_id
+                    );
                 }
                 Err(e) => {
                     if e.code == "E01" || e.code == "E02" {
@@ -339,17 +430,84 @@ impl Daemon {
                             now,
                         );
                         self.store.update_request_status(req.id, "denied")?;
+                        if let Ok(mut retry) = self.retry_state.lock() {
+                            retry.remove(&req.id);
+                        }
                     } else {
-                        let _ = self.store.audit(
-                            "wait",
-                            Some(&req.agent_id),
-                            Some(&req.job_id),
-                            None,
-                            Some(&desktop),
-                            &format!("{}: grant failed: {}", e.code, e.message),
-                            now,
-                        );
-                        deferred.insert(req.id);
+                        // FIX-006/007: backoff and circuit breaker.
+                        let (decision, attempt) = {
+                            let mut retry = self
+                                .retry_state
+                                .lock()
+                                .map_err(|_| MoError::e10("retry state lock poisoned"))?;
+                            let st = retry.entry(req.id).or_default();
+                            record_drain_failure(st, &e.code, now)
+                        };
+                        match decision {
+                            DrainRetryDecision::RetryAt(next) => {
+                                eprintln!(
+                                    "mo-daemon: drain retry request {} attempt {attempt} code {} next_retry {next}",
+                                    req.id, e.code
+                                );
+                                let _ = self.store.audit(
+                                    "wait",
+                                    Some(&req.agent_id),
+                                    Some(&req.job_id),
+                                    None,
+                                    Some(&desktop),
+                                    &format!(
+                                        "{}: grant failed (attempt {attempt}, next retry {next}): {}",
+                                        e.code, e.message
+                                    ),
+                                    now,
+                                );
+                                deferred.insert(req.id);
+                            }
+                            DrainRetryDecision::FailCap => {
+                                eprintln!(
+                                    "mo-daemon: drain cap request {} attempt {attempt} code {}: marked failed",
+                                    req.id, e.code
+                                );
+                                let _ = self.store.audit(
+                                    "drain_failed",
+                                    Some(&req.agent_id),
+                                    Some(&req.job_id),
+                                    None,
+                                    Some(&desktop),
+                                    &format!(
+                                        "max retries reached after {attempt} attempts, last error {}: {}",
+                                        e.code, e.message
+                                    ),
+                                    now,
+                                );
+                                self.store.update_request_status(req.id, "failed")?;
+                                if let Ok(mut retry) = self.retry_state.lock() {
+                                    retry.remove(&req.id);
+                                }
+                            }
+                            DrainRetryDecision::FailBreaker => {
+                                eprintln!(
+                                    "mo-daemon: circuit breaker request {} attempt {attempt} code {}: marked failed",
+                                    req.id, e.code
+                                );
+                                let _ = self.store.audit(
+                                    "circuit_breaker",
+                                    Some(&req.agent_id),
+                                    Some(&req.job_id),
+                                    None,
+                                    Some(&desktop),
+                                    &format!(
+                                        "circuit breaker tripped after {attempt} identical errors {}: {}",
+                                        e.code, e.message
+                                    ),
+                                    now,
+                                );
+                                self.store.update_request_status(req.id, "failed")?;
+                                if let Ok(mut retry) = self.retry_state.lock() {
+                                    retry.remove(&req.id);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -469,7 +627,9 @@ impl Daemon {
             .get("idempotency_key")
             .and_then(|v| v.as_str())
             .ok_or_else(|| MoError::e01("idempotency_key is required"))?;
-        let cancelled = crate::queue::cancel(&self.store, agent_id, key, now)?;
+        let cancelled = crate::queue::cancel(&self.store, agent_id, key, now, &|d: &str| {
+            crate::desktops::stop_desktop(d)
+        })?;
         Ok(json!({ "cancelled": cancelled, "status": "ok" }))
     }
 
@@ -665,6 +825,17 @@ impl Daemon {
             .map_err(|e| MoError::e10(format!("cannot bind socket {socket_path}: {e}")))?;
         std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| MoError::e10(format!("cannot chmod 0600 socket {socket_path}: {e}")))?;
+        // FIX-002: the socket is bound before the startup drain runs.
+        // The drain runs on its own thread, so a slow drain over
+        // failing provisions never blocks the bind or the accept loop.
+        // The tick thread drains every 10 s as well; the drain lock
+        // keeps the two passes single-flight.
+        {
+            let daemon = Arc::clone(self);
+            std::thread::spawn(move || {
+                let _ = daemon.drain_queue();
+            });
+        }
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
@@ -803,6 +974,23 @@ mod tests {
             }));
             HealthyInv { _lock: lock }
         }
+
+        /// Low-memory variant. NEW-002: the skip-coalescing test needs
+        /// a request that never fits, but a max-size 4096 MB request
+        /// fits on any host with more than 4096 MB available (the VM
+        /// has ~5900 MB). A fixed 512 MB inventory makes the non-fit
+        /// host-independent. Same lock and drop-clear as set().
+        fn set_low_mem() -> Self {
+            let lock = crate::inventory::TEST_LOCK.lock().unwrap();
+            crate::inventory::set_test_inventory(Some(crate::core::Inventory {
+                mem_available_mb: 512,
+                mem_total_mb: 8192,
+                load1: 0.5,
+                disk_free_gb: 50.0,
+                ..Default::default()
+            }));
+            HealthyInv { _lock: lock }
+        }
     }
 
     impl Drop for HealthyInv {
@@ -864,6 +1052,107 @@ mod tests {
         let bad = call(&sock, &json!({ "cmd": "nope" })).unwrap();
         assert_eq!(bad["error"], "E01");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// FIX-003/TEST-043: 15 concurrent requests leave the daemon up
+    /// and the socket responsive. Every call gets a response, and a
+    /// health check after the storm still answers.
+    #[test]
+    fn fifteen_concurrent_requests_keep_daemon_up() {
+        let _inv = HealthyInv::set();
+        let (cfg, dir, sock) = tmp_cfg();
+        let store = Arc::new(Store::open(&cfg.db_path).unwrap());
+        let daemon = Arc::new(Daemon::new(store, cfg.clone(), Arc::new(ChromebookAdapter)));
+        let sock2 = sock.clone();
+        std::thread::spawn(move || {
+            let _ = daemon.serve(&sock2);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let sock = Arc::new(sock);
+        let mut handles = Vec::new();
+        for i in 0..15 {
+            let s = Arc::clone(&sock);
+            handles.push(std::thread::spawn(move || {
+                let mut msg = request_json();
+                msg["request"]["job_id"] = json!(format!("storm-{i}"));
+                call(s.as_str(), &msg)
+            }));
+        }
+        let mut granted = 0;
+        for h in handles {
+            let resp = h
+                .join()
+                .expect("request thread panicked")
+                .expect("request call failed");
+            assert!(resp.get("status").is_some(), "no status in {resp}");
+            if resp["status"] == "granted" {
+                granted += 1;
+            }
+        }
+        let health = call(sock.as_str(), &json!({ "cmd": "health" })).unwrap();
+        assert_eq!(health["db"], "ok", "health: {health}");
+        let status = call(sock.as_str(), &json!({ "cmd": "status" })).unwrap();
+        assert_eq!(status["active_leases"], granted);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// FIX-002/TEST-054: a stale socket file is removed on startup and
+    /// the daemon binds and serves.
+    #[test]
+    fn stale_socket_is_removed_on_startup() {
+        let (cfg, dir, sock) = tmp_cfg();
+        std::fs::write(&sock, b"stale").unwrap();
+        let store = Arc::new(Store::open(&cfg.db_path).unwrap());
+        let daemon = Arc::new(Daemon::new(store, cfg.clone(), Arc::new(ChromebookAdapter)));
+        let sock2 = sock.clone();
+        std::thread::spawn(move || {
+            let _ = daemon.serve(&sock2);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let health = call(&sock, &json!({ "cmd": "health" })).unwrap();
+        assert_eq!(health["db"], "ok", "health: {health}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// FIX-006/TEST-045: backoff delays are 30, 60, 120, 240 s and
+    /// there is no 5th retry. Distinct error codes are used so the
+    /// circuit breaker does not trip first.
+    #[test]
+    fn drain_backoff_schedule() {
+        let now = 1_700_000_000;
+        let mut st = DrainRetryState::default();
+        let mut delays = Vec::new();
+        for code in ["E04", "E05", "E06", "E07"] {
+            let (d, _) = record_drain_failure(&mut st, code, now);
+            match d {
+                DrainRetryDecision::RetryAt(t) => delays.push(t - now),
+                other => panic!("expected RetryAt, got {other:?}"),
+            }
+        }
+        assert_eq!(delays, vec![30, 60, 120, 240]);
+        let (d, attempts) = record_drain_failure(&mut st, "E04", now);
+        assert_eq!(d, DrainRetryDecision::FailCap);
+        assert_eq!(attempts, 5);
+    }
+
+    /// FIX-007/TEST-046: 3 consecutive identical errors trip the
+    /// breaker and mark the request failed.
+    #[test]
+    fn circuit_breaker_trips_on_three_identical_errors() {
+        let now = 1_700_000_000;
+        let mut st = DrainRetryState::default();
+        let (d, _) = record_drain_failure(&mut st, "E04", now);
+        assert!(matches!(d, DrainRetryDecision::RetryAt(_)));
+        let (d, _) = record_drain_failure(&mut st, "E04", now);
+        assert!(matches!(d, DrainRetryDecision::RetryAt(_)));
+        let (d, attempts) = record_drain_failure(&mut st, "E04", now);
+        assert_eq!(d, DrainRetryDecision::FailBreaker);
+        assert_eq!(attempts, 3);
+        // A different code resets the identical-error run.
+        let mut st2 = DrainRetryState::default();
+        record_drain_failure(&mut st2, "E04", now);
+        record_drain_failure(&mut st2, "E05", now);
+        assert_eq!(st2.consecutive_same, 1);
     }
 
     /// Footgun 1: a client that connects and sends nothing must not
@@ -1320,12 +1609,17 @@ mod tests {
     /// Skip audits coalesce: two drain passes write one skip row.
     #[test]
     fn skip_audits_coalesce_within_a_minute() {
+        // NEW-002: the inventory is fixed low, so the 4096 MB request
+        // never fits on any host. The old premise (MemAvailable ~600 MB
+        // on the dev VM) failed on the chromebook-vm (~5900 MB), where
+        // the request fit, no skip was audited, and the test failed.
+        let _inv = HealthyInv::set_low_mem();
         let (cfg, dir, _sock) = tmp_cfg();
         let store = Arc::new(Store::open(&cfg.db_path).unwrap());
         let daemon = Daemon::new(store.clone(), cfg, Arc::new(ChromebookAdapter));
         let mut big = request_json();
         big["request"]["job_id"] = json!("big");
-        // 4096 MB validates but never fits on this host (MemAvailable ~600 MB).
+        // 4096 MB validates but never fits against the fixed 512 MB inventory.
         big["request"]["mem_mb"] = json!(4096);
         daemon.handle(&big);
         daemon.drain_queue().unwrap();
@@ -1347,6 +1641,9 @@ mod tests {
     /// leases, vd1 and vd2, in the same second).
     #[test]
     fn concurrent_drains_grant_once() {
+        // Healthy inventory: without the guard this test flakes when
+        // parallel tests spike live load1 and the grant stops fitting.
+        let _inv = HealthyInv::set();
         let (cfg, dir, _sock) = tmp_cfg();
         let store = Arc::new(Store::open(&cfg.db_path).unwrap());
         let daemon = Arc::new(Daemon::new(store.clone(), cfg, Arc::new(ChromebookAdapter)));

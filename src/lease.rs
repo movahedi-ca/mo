@@ -181,6 +181,12 @@ pub fn grant(
             Ok(s) => started = s,
             Err(e) => {
                 rollback(store, &lease, req, desktop, now, &e.message, stop, true);
+                // FIX-004 follow-up: a CDP timeout is a distinct E15.
+                // Preserve it so the caller sees the distinct code;
+                // every other provision error still wraps as E04.
+                if e.code == "E15" {
+                    return Err(e);
+                }
                 return Err(MoError::e04(format!(
                     "provision failed for {desktop}: {}",
                     e.message
@@ -638,6 +644,24 @@ pub fn reclaim_check(
             "CDP dead but Chrome lives: operator flagged".to_string(),
         ));
     }
+    // NEW-001: a held Chrome profile lock means Chrome is starting
+    // (or shutting down) on this desktop. The probe says the desktop
+    // is dead, but the lock says a Chrome is in flight, so the
+    // desktop is never freed on this evidence alone.
+    if probe.lock_held {
+        store.audit(
+            "reclaim_kept",
+            Some(&lease.agent_id),
+            Some(&lease.job_id),
+            Some(lease_id),
+            Some(&lease.desktop),
+            "profile lock held: Chrome starting, no kill",
+            now,
+        )?;
+        return Ok(ReclaimOutcome::KeptStale(
+            "profile lock held: Chrome starting".to_string(),
+        ));
+    }
     // OBS-007: CDP responds but no Chrome process exists. The desktop
     // is dead even though the port answers, so it is freed like the
     // CDP-dead case, with an audit row that says so.
@@ -809,6 +833,82 @@ mod tests {
         assert_eq!(g.status, "granted");
         let lease = s.get_lease(&g.lease_id).unwrap().unwrap();
         assert_eq!(lease.state, "active");
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// TEST-051 (FIX-011): the lease ROW in the store records a
+    /// non-null CDP port for a Chrome lease, and null for a no-desktop
+    /// lease. The Grant struct alone is not enough; the row is what
+    /// status, reclaim, and the dashboard read.
+    #[test]
+    fn lease_row_records_cdp_port() {
+        let (s, p) = tmp_store();
+        let cfg = Config::from_env();
+        let req = queued_req();
+        let g = grant(
+            &s,
+            &req,
+            "vd1",
+            &inv_ok(),
+            &cfg,
+            now_unix(),
+            &ok_provision,
+            &ok_stop,
+        )
+        .unwrap();
+        let row = s.get_lease(&g.lease_id).unwrap().unwrap();
+        assert_eq!(row.cdp_port, Some(9333));
+        assert_eq!(row.desktop, "vd1");
+        // A cpu-ram lease holds no desktop and no Chrome: null port.
+        let g2 = grant(
+            &s,
+            &req,
+            "none",
+            &inv_ok(),
+            &cfg,
+            now_unix(),
+            &ok_provision,
+            &ok_stop,
+        )
+        .unwrap();
+        let row2 = s.get_lease(&g2.lease_id).unwrap().unwrap();
+        assert_eq!(row2.cdp_port, None);
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// FIX-004 follow-up: a provision that fails with the distinct E15
+    /// CDP timeout surfaces E15 to the caller, not a re-wrapped E04.
+    /// The lease still rolls back to failed and the desktop frees.
+    #[test]
+    fn grant_preserves_e15_cdp_timeout() {
+        let (s, p) = tmp_store();
+        let cfg = Config::from_env();
+        let req = queued_req();
+        let timeout = |_d: &str| -> Result<bool> {
+            Err(MoError::e15(
+                "CDP never responded on vd1 port 9333 after 60s",
+            ))
+        };
+        let err = grant(
+            &s,
+            &req,
+            "vd1",
+            &inv_ok(),
+            &cfg,
+            now_unix(),
+            &timeout,
+            &ok_stop,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "E15");
+        assert!(s.list_leases(&["active"]).unwrap().is_empty());
+        let failed = s.list_leases(&["failed"]).unwrap();
+        assert_eq!(failed.len(), 1);
+        let (cpu, mem, held) = s.reserved_totals().unwrap();
+        assert_eq!((cpu, mem), (0, 0));
+        assert!(held.is_empty());
         drop(s);
         let _ = std::fs::remove_file(p);
     }
@@ -1563,6 +1663,80 @@ mod tests {
             reclaim_check(&s, &id, now + 602, &cfg, &probe).unwrap(),
             ReclaimOutcome::KeptStale(_)
         ));
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// NEW-001: a held profile lock keeps the desktop even when the
+    /// probe says CDP is dead and no Chrome process is alive. Chrome
+    /// is starting, so the desktop is not freed.
+    #[test]
+    fn reclaim_keeps_when_profile_lock_held() {
+        let (s, p, id, cfg, now) = granted_lease();
+        let _ = sweep_stale(&s, now + 601, &cfg).unwrap();
+        let after_grace = now + 601 + 5 * 60 + 1;
+        let probe = ReclaimProbe {
+            cdp_ok: false,
+            chrome_alive: false,
+            lock_held: true,
+        };
+        assert_eq!(
+            reclaim_check(&s, &id, after_grace, &cfg, &probe).unwrap(),
+            ReclaimOutcome::KeptStale("profile lock held: Chrome starting".to_string())
+        );
+        assert_eq!(s.get_lease(&id).unwrap().unwrap().state, "stale");
+        // Lock free: the same dead probe releases the desktop.
+        let probe = ReclaimProbe {
+            cdp_ok: false,
+            chrome_alive: false,
+            lock_held: false,
+        };
+        assert_eq!(
+            reclaim_check(&s, &id, after_grace, &cfg, &probe).unwrap(),
+            ReclaimOutcome::Released
+        );
+        drop(s);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// FIX-009/TEST-049: a reserving lease always resolves to granted
+    /// or failed, never vanishes. Both the success and the failure
+    /// path leave zero reserving rows: reserve, commit, and rollback
+    /// each run inside one store transaction.
+    #[test]
+    fn reserving_always_resolves_to_granted_or_failed() {
+        let (s, p) = tmp_store();
+        let cfg = Config::from_env();
+        let req = queued_req();
+        let now = now_unix();
+        let g = grant(
+            &s,
+            &req,
+            "vd1",
+            &inv_ok(),
+            &cfg,
+            now,
+            &ok_provision,
+            &ok_stop,
+        )
+        .unwrap();
+        assert_eq!(s.get_lease(&g.lease_id).unwrap().unwrap().state, "active");
+        let err = grant(
+            &s,
+            &req,
+            "vd2",
+            &inv_ok(),
+            &cfg,
+            now,
+            &fail_provision,
+            &ok_stop,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "E04");
+        assert!(s.list_leases(&["reserving"]).unwrap().is_empty());
+        let failed = s.list_leases(&["failed"]).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].desktop, "vd2");
         drop(s);
         let _ = std::fs::remove_file(p);
     }

@@ -1,4 +1,4 @@
-//! Core types, error codes E01-E14, config, time helpers.
+//! Core types, error codes E01-E15, config, time helpers.
 //! No host facts live here. Host facts live in `host`.
 
 use serde::{Deserialize, Serialize};
@@ -75,6 +75,13 @@ impl MoError {
     }
     pub fn e14(msg: impl Into<String>) -> Self {
         Self::new("E14", msg, "Never fold :1, never kill :1 Chrome")
+    }
+    /// FIX-004: CDP never responded after a cold provision launched
+    /// Chrome. Distinct from E04 so a deterministic Chrome-start
+    /// failure is visible to the caller and to the drain circuit
+    /// breaker instead of hiding inside a generic provision error.
+    pub fn e15(msg: impl Into<String>) -> Self {
+        Self::new("E15", msg, "Check the Chrome log, retry later")
     }
 }
 
@@ -695,6 +702,7 @@ mod tests {
     #[test]
     fn error_codes_present() {
         assert_eq!(MoError::e14("x").code, "E14");
+        assert_eq!(MoError::e15("x").code, "E15");
         assert_eq!(MoError::e01("x").code, "E01");
     }
 

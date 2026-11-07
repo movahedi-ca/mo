@@ -17,6 +17,47 @@ fn vd_stop_script() -> String {
         .unwrap_or_else(|_| format!("{}/vd-stop.sh", crate::core::jobs_dir()))
 }
 
+/// Path to the Chrome launcher for a vd. Overridable with
+/// MO_VD_CHROME_SCRIPT for tests. Default is ~/jobs/vd-chrome.sh, a
+/// thin wrapper over ~/jobs/virtual-desktops/vd-chrome.sh on the VM.
+fn vd_chrome_script() -> String {
+    std::env::var("MO_VD_CHROME_SCRIPT")
+        .unwrap_or_else(|_| format!("{}/vd-chrome.sh", crate::core::jobs_dir()))
+}
+
+/// CDP wait for a cold provision (FIX-005, ADR-003): 60 s. Chrome
+/// under load needs more than the old 10 s. Never 0, never unbounded.
+pub const CDP_WAIT_SECS: u64 = 60;
+
+/// Effective CDP wait in seconds. Production uses CDP_WAIT_SECS.
+/// MO_CDP_WAIT_SECS overrides it for tests only, so TEST-044 and
+/// TEST-050 can fail fast instead of waiting the full 60 s. A value
+/// of 0 is ignored: the wait is never zero.
+fn cdp_wait_secs() -> u64 {
+    std::env::var("MO_CDP_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(CDP_WAIT_SECS)
+}
+
+/// Launch Chrome on a desktop via vd-chrome.sh (FIX-004, ADR-003).
+/// The desktop must already be up. The script takes the desktop NAME
+/// (vdK), not the number. It launches detached and returns promptly;
+/// CDP readiness is checked separately by wait_cdp.
+pub fn launch_chrome(id: &str) -> Result<()> {
+    eprintln!("mo-daemon: chrome launch {id} via vd-chrome.sh");
+    let status = std::process::Command::new(vd_chrome_script())
+        .arg(id)
+        .status()
+        .map_err(|e| MoError::e04(format!("vd-chrome failed to run: {e}")))?;
+    if !status.success() {
+        return Err(MoError::e04(format!("vd-chrome {id} exited {status}")));
+    }
+    eprintln!("mo-daemon: chrome launch {id} ok");
+    Ok(())
+}
+
 /// Static desktop list with live up status from CDP.
 /// Desktop bitmap cached for 5 seconds. The probe, the dashboard,
 /// and the bypass check share one read instead of each opening 11
@@ -82,7 +123,8 @@ pub fn vnc_ok(port: i64) -> bool {
     .is_ok()
 }
 
-/// Wait up to `secs` for CDP to respond. 10 seconds at grant time.
+/// Wait up to `secs` for CDP to respond. Cold provisions wait
+/// CDP_WAIT_SECS (60 s, FIX-005).
 pub fn wait_cdp(port: i64, secs: u64) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(secs);
     loop {
@@ -119,12 +161,17 @@ pub fn profile_lock_free(profile: &str) -> bool {
     !std::path::Path::new(&format!("{profile}/SingletonLock")).exists()
 }
 
-/// Start a desktop via the vd script, then wait for CDP.
-/// Main display is already up and is never started here.
+/// Start a desktop via the vd script, launch Chrome on it, then wait
+/// for CDP. Main display is already up and is never started here.
 /// Idempotent: when CDP already responds on the desktop's port, the
 /// desktop is already up and vd-start is not run. vd-start exits 1 on
 /// an already-running desktop, so running it unconditionally made every
 /// grant for a warm desktop fail (live host, 2026-11-06: vd1-vd6 up).
+/// FIX-010: vd-start gets the desktop NUMBER (vd1 becomes 1), matching
+/// its count interface. FIX-004: after vd-start succeeds, Chrome is
+/// launched via vd-chrome.sh before the CDP wait, so a cold desktop
+/// can produce a responding CDP. FIX-005: the CDP wait is
+/// CDP_WAIT_SECS (60 s). A timeout fails with E15, distinct from E04.
 pub fn start_desktop(id: &str) -> Result<Desktop> {
     if id == "main-display" {
         return Ok(list_desktops().into_iter().next().unwrap());
@@ -149,17 +196,21 @@ pub fn start_desktop(id: &str) -> Result<Desktop> {
         });
     }
     let status = std::process::Command::new(vd_start_script())
-        .arg(id)
+        .arg(n.to_string())
         .status()
         .map_err(|e| MoError::e04(format!("vd-start failed to run: {e}")))?;
     if !status.success() {
         return Err(MoError::e04(format!("vd-start {id} exited {status}")));
     }
-    if !wait_cdp(port, 10) {
-        return Err(MoError::e04(format!(
-            "CDP never responded on vd{n} port {port}"
+    launch_chrome(id)?;
+    let wait = cdp_wait_secs();
+    if !wait_cdp(port, wait) {
+        eprintln!("mo-daemon: CDP wait {id} port {port}: timeout after {wait}s");
+        return Err(MoError::e15(format!(
+            "CDP never responded on vd{n} port {port} after {wait}s"
         )));
     }
+    eprintln!("mo-daemon: CDP wait {id} port {port}: responded");
     Ok(Desktop {
         id: id.to_string(),
         display: format!(":{}", n + 1),
@@ -572,5 +623,183 @@ mod tests {
     #[test]
     fn cdp_dead_on_unused_port() {
         assert!(!cdp_ok(59999));
+    }
+
+    /// Save and restore env vars a test overrides. Env is process
+    /// global, so tests that set script paths restore them on drop,
+    /// the same pattern the existing tests use inline.
+    struct EnvRestore(Vec<(&'static str, Option<String>)>);
+    impl EnvRestore {
+        fn set(pairs: &[(&'static str, String)]) -> Self {
+            let saved: Vec<(&'static str, Option<String>)> = pairs
+                .iter()
+                .map(|(k, _)| (*k, std::env::var(k).ok()))
+                .collect();
+            for (k, v) in pairs {
+                std::env::set_var(k, v);
+            }
+            EnvRestore(saved)
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in self.0.drain(..) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// Unique scratch dir for one test.
+    fn fix_tmp_dir(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = format!("/tmp/mo-fix-{tag}-{nanos}");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Fake vd script: logs its args to `marker`, exits 0.
+    fn write_fake_script(path: &str, marker: &str) {
+        let body = format!("#!/bin/sh\necho \"$@\" >> \"{marker}\"\nexit 0\n");
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// Wait until nothing answers on `port`, up to `secs`. Guards
+    /// against another test briefly holding the same CDP port.
+    fn wait_port_free(port: i64, secs: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if !cdp_ok(port) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// TEST-050 (FIX-010): the vd-start call passes the desktop NUMBER.
+    /// vd1 becomes 1. The vd-chrome call still passes the NAME (vd1),
+    /// which is the vd-chrome.sh interface.
+    #[test]
+    fn vd_start_receives_number_for_vd1() {
+        wait_port_free(9333, 5);
+        let dir = fix_tmp_dir("050");
+        let start_script = format!("{dir}/vd-start.sh");
+        let chrome_script = format!("{dir}/vd-chrome.sh");
+        let start_marker = format!("{dir}/start-args");
+        let chrome_marker = format!("{dir}/chrome-args");
+        write_fake_script(&start_script, &start_marker);
+        write_fake_script(&chrome_script, &chrome_marker);
+        let _env = EnvRestore::set(&[
+            ("MO_VD_START_SCRIPT", start_script),
+            ("MO_VD_CHROME_SCRIPT", chrome_script),
+            ("MO_CDP_WAIT_SECS", "1".to_string()),
+        ]);
+        let err = start_desktop("vd1").unwrap_err();
+        assert_eq!(err.code, "E15");
+        assert_eq!(std::fs::read_to_string(&start_marker).unwrap().trim(), "1");
+        assert_eq!(
+            std::fs::read_to_string(&chrome_marker).unwrap().trim(),
+            "vd1"
+        );
+    }
+
+    /// TEST-044 (FIX-004, FIX-005): a cold provision succeeds within
+    /// 60 s when Chrome starts. Fake vd-start and vd-chrome scripts
+    /// stand in for the VM scripts; a listener on the CDP port stands
+    /// in for Chrome. vd9 (port 9341) avoids the vd1 port other tests
+    /// use. The real 60 s default applies here, no override.
+    #[test]
+    fn cold_provision_succeeds_when_chrome_starts() {
+        wait_port_free(9341, 5);
+        let dir = fix_tmp_dir("044a");
+        let start_script = format!("{dir}/vd-start.sh");
+        let chrome_script = format!("{dir}/vd-chrome.sh");
+        let start_marker = format!("{dir}/start-args");
+        let chrome_marker = format!("{dir}/chrome-args");
+        write_fake_script(&start_script, &start_marker);
+        write_fake_script(&chrome_script, &chrome_marker);
+        let _env = EnvRestore::set(&[
+            ("MO_VD_START_SCRIPT", start_script),
+            ("MO_VD_CHROME_SCRIPT", chrome_script),
+        ]);
+        let started_at = std::time::Instant::now();
+        let handle = std::thread::spawn(|| provision_desktop("vd9"));
+        let mut listener = None;
+        for _ in 0..300 {
+            if std::path::Path::new(&chrome_marker).exists() {
+                listener = Some(std::net::TcpListener::bind("127.0.0.1:9341").unwrap());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let started = handle.join().unwrap().unwrap();
+        assert!(started);
+        assert!(started_at.elapsed() < std::time::Duration::from_secs(60));
+        assert!(listener.is_some(), "fake vd-chrome script never ran");
+        assert_eq!(std::fs::read_to_string(&start_marker).unwrap().trim(), "9");
+        assert_eq!(
+            std::fs::read_to_string(&chrome_marker).unwrap().trim(),
+            "vd9"
+        );
+        drop(listener);
+    }
+
+    /// TEST-044 (FIX-005): a cold provision with no Chrome fails
+    /// cleanly with the distinct E15 code. The 1 s override keeps the
+    /// test fast; the production 60 s value is asserted, and wait_cdp
+    /// honoring its seconds argument is what makes the 60 s real. The
+    /// literal 60 s run is the ignored test below.
+    #[test]
+    fn cold_provision_fails_cleanly_at_cdp_timeout() {
+        assert_eq!(CDP_WAIT_SECS, 60);
+        assert!(!wait_cdp(59998, 1));
+        wait_port_free(9341, 5);
+        let dir = fix_tmp_dir("044b");
+        let start_script = format!("{dir}/vd-start.sh");
+        let chrome_script = format!("{dir}/vd-chrome.sh");
+        write_fake_script(&start_script, &format!("{dir}/start-args"));
+        write_fake_script(&chrome_script, &format!("{dir}/chrome-args"));
+        let _env = EnvRestore::set(&[
+            ("MO_VD_START_SCRIPT", start_script),
+            ("MO_VD_CHROME_SCRIPT", chrome_script),
+            ("MO_CDP_WAIT_SECS", "1".to_string()),
+        ]);
+        let started_at = std::time::Instant::now();
+        let err = provision_desktop("vd9").unwrap_err();
+        assert_eq!(err.code, "E15");
+        assert!(started_at.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// TEST-044 literal check (ignored in the normal suite: it waits
+    /// the full production timeout). Run with
+    /// `cargo test --release -- --ignored`. Proves a cold provision
+    /// with no Chrome fails at about 60 s, not a hang and not the
+    /// old 10 s.
+    #[test]
+    #[ignore]
+    fn cold_provision_fails_at_sixty_seconds() {
+        wait_port_free(9341, 5);
+        let dir = fix_tmp_dir("044c");
+        let start_script = format!("{dir}/vd-start.sh");
+        let chrome_script = format!("{dir}/vd-chrome.sh");
+        write_fake_script(&start_script, &format!("{dir}/start-args"));
+        write_fake_script(&chrome_script, &format!("{dir}/chrome-args"));
+        let _env = EnvRestore::set(&[
+            ("MO_VD_START_SCRIPT", start_script),
+            ("MO_VD_CHROME_SCRIPT", chrome_script),
+        ]);
+        let started_at = std::time::Instant::now();
+        let err = provision_desktop("vd9").unwrap_err();
+        assert_eq!(err.code, "E15");
+        let secs = started_at.elapsed().as_secs();
+        assert!((55..=75).contains(&secs), "took {secs}s, want about 60s");
     }
 }

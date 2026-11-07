@@ -24,37 +24,47 @@ toolchain: rustc 1.99.1, installed locally via rustup stable (this host had no r
 deps: rusqlite 0.32, serde 1, serde_json 1, clap 4, uuid 1 (five runtime deps, Cargo.lock pinned)
 
 deviations:
-  - systemd timer unit not created: the 60s inventory snapshot and 30s
+  - >-
+    systemd timer unit not created: the 60s inventory snapshot and 30s
     dashboard refresh run inside the daemon. A separate timer unit would
     duplicate that work. Service unit covers the daemon. Noted in the unit file.
-  - ARM64 compile check blocked: no aarch64-linux-gnu-gcc on this host.
+  - >-
+    ARM64 compile check blocked: no aarch64-linux-gnu-gcc on this host.
     `cargo check --target aarch64-unknown-linux-gnu` fails in libsqlite3-sys
     build script (ToolNotFound). Not a code issue. TASK-020 owner to verify
     where a cross compiler exists.
-  - TASK-015/016 test deviations (2026-11-06, tester): benchmarks and
+  - >-
+    TASK-015/016 test deviations (2026-11-06, tester): benchmarks and
     adversarial tests ran on this dev VM, not chromebook-vm, with fake
     fixtures in private mount namespaces (fake BAT0 78%, fake meminfo
     6000 MB + fake cpuinfo 16 cores for multi-lease tests, fake vd
     scripts opening TCP listeners on CDP ports, fake bridge responder).
     Guards set to 0 by env (host MemAvailable 635-760 MB is below the
     1200 MB default guard). No MO code was changed for the tests.
-  - TEST-024 deviation: bridge-down requests stay queued, not denied.
+  - >-
+    TEST-024 deviation: bridge-down requests stay queued, not denied.
     No partial grant. E04 appears in the response.
-  - TEST-037 observation: inventory reads the battery sensor directly,
+  - >-
+    TEST-037 observation: inventory reads the battery sensor directly,
     never through the HostAdapter, so Oracle has_battery=false is not
     consulted by the battery gate.
 
 defects:
-  - DEFECT-001 (major): unique index on desktop covers "none", so only
+  - >-
+    DEFECT-001 (major): unique index on desktop covers "none", so only
     one cpu-ram lease can be active at a time. Second cpu-ram request
     is denied. Evidence in implementation/test-evidence.md.
-  - DEFECT-002 (major): release never stops the desktop. A released vd
+  - >-
+    DEFECT-002 (major): release never stops the desktop. A released vd
     keeps its CDP listener up. Fold then refuses it (E13, CDP responds).
-  - DEFECT-003 (major): no bypass detection. A desktop started without
+  - >-
+    DEFECT-003 (major): no bypass detection. A desktop started without
     a lease produces zero audit events (TEST-038 FAIL).
-  - DEFECT-004 (minor): failed vd-stop writes no audit row and flags
+  - >-
+    DEFECT-004 (minor): failed vd-stop writes no audit row and flags
     nothing (TEST-041 FAIL). Error E04 surfaces, nothing is recorded.
-  - DEFECT-005 (minor): systemd unit puts StartLimitBurst and
+  - >-
+    DEFECT-005 (minor): systemd unit puts StartLimitBurst and
     StartLimitIntervalSec under [Service]; both are [Unit] keys and
     are ignored. Restart rate limiting is inactive.
 
@@ -63,7 +73,8 @@ observations:
     and ~9 ms with the bridge up. Target still passes.
   - CLI responses mask real denial reasons (E05/E06/E07) as generic
     queued/E04 while the request row is marked denied.
-  - No startup drain: a queued request surviving a crash waits for
+  - >-
+    No startup drain: a queued request surviving a crash waits for
     the next request to arrive (TEST-022).
   - No CLI cancel command although queue::cancel exists.
   - No CPU-load admission gate exists; load is only observed.
@@ -73,7 +84,8 @@ notes:
 
 notes:
   - No deploy done. No remote configured. No push made.
-  - Daemon smoke tested live on this host (debug build, /tmp paths):
+  - >-
+    Daemon smoke tested live on this host (debug build, /tmp paths):
     request -> granted, status, heartbeat, extend, release, health all JSON OK.
   - Socket round trip test covers request to release over a live Unix socket.
 
@@ -196,3 +208,265 @@ dashboard_app_2026_11_06:
     - ":0 physical screen still shows the :0 kiosk Chrome frame (tab strip + address bar) around the noVNC view; the :1 content inside it is now the fullscreen app. Making :0 itself frameless needs the :0 viewer relaunched in kiosk mode (no WM on :0, F11 does not work there). Not done in this run."
     - "TEST-010 real host reboot not run; no safe window"
     - "TASK-020 ARM64 still blocked: no cross linker"
+
+# --- MO fix plan, 2026-11-06 (FIX-000..018, playbook v1.0) ---
+fix_plan_2026_11_06:
+  playbook: "~/workspace/your_files/mo-fix-plan-playbook.md (v1.0, DRAFT)"
+  status: "complete - all 19 tasks done"
+  current_task: "DONE"
+  last_updated: "2026-11-06 19:45 EST (FIX-018 docs + handover complete)"
+  fix_018:
+    status: "completed_verified"
+    evidence:
+      - "Runbook updated: fix-plan behavior section, VM-build upgrade method, rollback-verified note, E15 troubleshooting row, startup-drain rows corrected, open items updated (README count 112, TEST-055 vd-profile note, status lag note, mo-fix15 drivers note)."
+      - "README test count fixed in both places: 94 -> 112 passed, 0 failed, 1 ignored."
+      - "V3 playbook section 11.2a added: TEST-043..057 table with the new behavior summary."
+      - "Handover package written: implementation/fix-plan-handover.md (10 items per playbook 18.2)."
+      - "Fix-plan playbook 18.3 updated: LIMIT-001/005/006/007 resolved, LIMIT-008..011 added."
+  fix_017_deploy:
+    status: "completed_verified"
+    approval_basis: "Mohammad's 'apply all fixes' via the parent task (2026-11-06). Playbook APR-002 recorded as approved on that basis."
+    deployed_commit_local: "67a000f (master, FIX-000..014 + NEW-001 + NEW-002)"
+    build_host: "chromebook-vm (~/mo-build, cargo 1.99.1). Source pushed via cb-xfer.sh (sha256 verified). First push failed: destination dir ~/mo-build did not exist; created it, retry passed."
+    vm_test_gate: "cargo test --release on the VM: first run 111 passed, 1 failed (pre-existing skip_audits host-dependent test). Fixed as NEW-002. Re-run: 112 passed, 0 failed, 1 ignored, twice in a row. Clippy 0 warnings, fmt clean, both hosts."
+    binaries_new:
+      mo_daemon: "2,942,280 bytes, sha256 443665b83e915992..."
+      mo_cli: "sha256 5195afb038c7e2bf..."
+    binaries_old_v010:
+      mo_daemon: "2,876,984 bytes, sha256 683b9d71888d4d99..."
+      mo_cli: "sha256 d0b1d53ea8626a83db422e7fb2829db0..."
+    backups: "~/.local/bin/mo-daemon.bak-20261106-1905, ~/.local/bin/mo-cli.bak-20261106-1905 (both verified, old shas match live pre-deploy)"
+    predeploy: "0 leases, 0 queue, desktops 1, chrome 24, no GoA worker process. Daemon PID 129277 since 17:46:17 EST."
+    deploy: "Stop (clean, inactive), install new binaries, start. New PID 165442 at 19:05:03 EST. Journal shows the new startup line with PID (FIX-002): 'mo-daemon up: pid=165442 ...'."
+    smoke_test:
+      - "Cold vd-chrome grant via mo-cli: lease mo-1794009936-2edac0, vd1, :2, CDP 9333, VNC 5903, started_desktop 1, active. FIRST cold vd-chrome grant ever (D7 fixed live)."
+      - "CDP responds on 9333: Protocol-Version 1.3, Chrome/156. Verified by curl."
+      - "cpu-ram grant: mo-1794009943-771514, granted."
+      - "Both released cleanly. CDP 9333 down after release (vd1 stopped, started_desktop 1). After 45 s: 0 leases, 0 queue, desktops 1, chrome 24 (baseline). No Xvfb/vd Chrome processes remain. Journal: 'CDP wait vd1 port 9333: responded'. No errors, no panics."
+    rollback_verified: "Restored v0.1.0 binaries from the 1905 backups (daemon sha 683b9d71), restarted, daemon up, status serves, 0 leases, 0 queue. Then redeployed the fix (sha 443665b8), new PID 166598 at 19:06:56 EST, status up, 0/0/1/24."
+    note: "mo-cli release takes --lease, not --lease-id (first attempt errored on the flag name; corrected)."
+  fix_015:
+    status: "completed_verified"
+    verdict: "PASS (AC-011, TEST-052)"
+    method: "10 simultaneous workers via parallel VM shell jobs (NOT subagents: depth-2 coordinator cannot spawn; simultaneity preserved, all 10 fired within 1 s). 6 cpu-ram (a1-a6), 4 vd-chrome (a7-a10). Hold 90 s, heartbeat every 20 s, clean release. Queued workers polled by idempotent replay every 15 s up to 300 s, then cancel."
+    fired: "2026-11-06 19:10:27 EST (all 10 created_unix 1794010227)"
+    grants: "4 at fire (a5 cpu, a7 vd2, a8 vd1, a10 vd3), 6 via drain (a1/a2/a4 cpu + a9 vd1 warm at +90 s; a3/a6 cpu at +180 s), 0 never granted"
+    daemon: "PID 166598 stable before/during/after, 0 restarts; socket ok throughout (monitor polled every 20 s, 0 failures)"
+    failed_rows: "0 total, 0 per request (limit 5)"
+    fifo: "grant order == arrival order exactly (a8,a5,a7,a10,a1,a2,a4,a9,a3,a6); fit skips recorded in audit ('cpu 1 over free 0') for the 6 queued"
+    cdp: "3 cold provisions (vd1/vd2/vd3, started_desktop 1, CDP ports 9333/9334/9335 recorded) + 1 warm reuse (vd1, started_desktop 0); chrome_count peaked 58 during test; all leases granted only after CDP responded (FIX-004 path). Journal unreadable as user auto (no systemd-journal group), so no journal CDP lines; grant + CDP-port + chrome-count evidence stands."
+    heartbeats: "5 per granted agent, all ok (leases show state released, end-start 300 s)"
+    cleanup: "0 leases, 0 queue, desktops 1, live chrome procs 24 = baseline (mo-cli snapshot lagged at 25 briefly, FIX-012 known lag)"
+    harness_note: "FIX-015 driver deadlocked at the end: bare `wait` waited on the monitor subshell too. Fixed by touching STOP_MONITOR from outside. FIX-016 driver waits on worker PIDs only."
+    evidence: "VM /tmp/mo-fix15/t1/* (per-agent logs, responses, monitor.log); local copy ~/workspace/mo-fix15/t1-evidence/t1/"
+  fix_016:
+    status: "completed_verified"
+    verdict: "PASS (AC-012, TEST-053)"
+    method: "15 simultaneous vd-chrome workers via parallel VM shell jobs (same depth-2 note as FIX-015). Each granted agent loads Yahoo Finance via CDP and extracts 2 assigned stocks (30 total) with extract.py + ~/workspace/chromebook-vm/yahoo-price-selectors.js (counts only, never prices). Hold 90 s, heartbeat every 20 s, clean release. Queued workers polled by replay every 15 s up to 420 s, then cancel."
+    smoke: "Pre-storm single cold vd-chrome grant (fix016-smoke, vd1, CDP 9333): extract 2/2, clean release, back to 0/0/1/24. Validated the extraction path before the storm."
+    fired: "2026-11-06 19:17:58 EST (all 15 created_unix 1794011078)"
+    grants: "4 at fire (a1 vd1, a15 vd2, a11 vd3, a6 vd4), 8 via drain (a2/a3/a8/a9 at +195 s; a4/a13/a12/a5 at +375-390 s), 3 never granted (a7, a10, a14: last in arrival order, hit the 420 s poll cap, cancelled; queue 0 after)"
+    daemon: "PID 166598 stable before/during/after, 0 restarts; socket ok throughout (monitor every 20 s, 0 failures)"
+    failed_rows: "0 total, 0 per request (limit 5)"
+    fifo: "grant order == arrival order exactly (a1,a15,a11,a6,a2,a3,a8,a9,a4,a13,a12,a5); the 3 never-granted were the last 3 arrivals; fit skips recorded in audit ('cpu 1 over free 0')"
+    cdp: "12/12 cold provisions (started_desktop 1, vd1-vd4 reused across waves, CDP ports 9333-9336 recorded, 0 null); every granted agent logged CDP_OK (Chrome/156.0.8078.73); chrome_count peaked 154 with 4 vd Chromes on Yahoo pages, load1 peaked 11.13"
+    extraction: "12/12 granted agents extracted 2/2 (24 stocks attempted, 24 found). 6 stocks never attempted (a7/a10/a14 never granted). No prices logged anywhere."
+    cleanup: "0 leases, 0 queue, desktops 1, live chrome procs 24 = baseline (verified 19:35 EST, after driver status-after snapshot lagged at desktops 3)"
+    evidence: "VM /tmp/mo-fix15/t2/* (per-agent logs, responses, monitor.log); scripts ~/workspace/mo-fix15/fix016.sh, extract.py, metrics16.py"
+  fix_013:
+    status: "completed_verified"
+    cause: "cb-job.sh `run` captured remote output in the FIXED path /tmp/cb-run.out on the VM, shared by every parallel call. One call's truncate (bash >) or rm emptied or mixed another call's output. Repro before fix, 10-way parallel `run` (echo MARKER-i, sleep 2, echo DONE-i): 9 of 10 empty stdout, 1 cross-mixed (MARKER-3 + DONE-7 in one call's output)."
+    fix: "cb-job.sh `run` now uses mktemp /tmp/cb-run.XXXXXX per call (same pattern `fetch` already uses). Same shared-fixed-path race fixed in `fetch-lp` (/tmp/cb-lp-url.txt, /tmp/cb-lp-out.md, /tmp/cb-lp-out.err -> mktemp per call). No MO code touched. Backup: chromebook-vm/cb-job.sh.bak-20261106. bash -n clean."
+    evidence:
+      - "TEST-057 equivalent, 10-way parallel run after fix: 10/10 PASS (each call returned its own MARKER-i + DONE-i, exactly 2 lines)"
+      - "Repeat 10-way run: 10/10 PASS"
+      - "Diff vs backup: only the `run` and `fetch-lp` capture paths changed"
+  fix_014:
+    status: "completed_verified"
+    finding: "No shared selector-list file existed anywhere in ~/workspace (rg over the tree, excluding venv/.git/node_modules: only the playbook and three test-2 agent transcripts mention the selectors). The list lived only in the test-2 coordinator brief. Created the canonical file: ~/workspace/chromebook-vm/yahoo-price-selectors.js (node --check clean). Order: [data-testid='qsp-price'] first, fin-streamer[data-field='fulldayPrice'] fallback. Dead selectors removed: fin-streamer[data-field='regularMarketPrice'], [data-test='qsp-price']."
+    evidence:
+      - "TEST-056: headless Chrome --dump-dom of https://finance.yahoo.com/quote/AAPL/ on the VM via cb-job.sh run (no display touched): data-testid=\"qsp-price\">342.37 extracted live, 3 matches"
+      - "Dead selectors confirmed 0 in the same dump: fin-streamer[data-field='regularMarketPrice'] 0 elements, [data-test='qsp-price'] 0"
+      - "Caveat: fin-streamer[data-field='fulldayPrice'] showed 0 elements in the headless dump (60 raw string matches in JSON payloads only); its 'present and non-empty' status rests on the test-2 record (a8 live Chrome), not re-verified here. Primary selector is verified live."
+  source_state:
+    local_branch: "master"
+    local_head: "b8e2ee0"
+    local_working_tree: "clean"
+    remote_main_head: "097dd51"
+    remote_head_ls_remote: "1bf41bcff85725421bf5eafc2691ce93f3100135"
+    note: "Local master and origin/main are UNRELATED histories. The playbook's 'remote HEAD 49934d33' does not exist anywhere. Tag v0.1.0 exists on remote main at 16e44943 (per deploy record above), not in the local repo."
+    recovery_point:
+      binary_backup: "~/.local/bin/mo-daemon.bak-20261106-1640 (2,865,272 bytes, verified present)"
+      db_backup: "~/jobs/mo/mo.db.bak-20261106-1640"
+      git_tag_v010_local: "NOT FOUND"
+  versions:
+    cargo: "1.99.1"
+    rustc: "1.99.1"
+    rusqlite: "0.32.1"
+    chrome_vm: "Google Chrome 156.0.8078.73"
+    chromium_vm: "Chromium 156.0.8078.79"
+    vm_os: "Debian 13 (trixie)"
+  modules:
+    daemon_entry: "src/main.rs (116 lines)"
+    socket_server_drain: "src/server.rs (1389 lines)"
+    desktops_provision: "src/desktops.rs (576 lines)"
+    lease_manager: "src/lease.rs (1580 lines)"
+    store_sqlite: "src/store.rs (1431 lines)"
+    core_types_config: "src/core.rs (726 lines)"
+    queue: "src/queue.rs (340 lines)"
+    scheduler: "src/sched.rs (233 lines)"
+  baselines:
+    cargo_test_release: "112 passed, 0 failed, 1 ignored (2026-11-06 19:05 EST, after all code fixes; baseline was 99)"
+    clippy: "0 warnings (2026-11-06 18:40 EST)"
+    fmt: "clean (2026-11-06 18:40 EST)"
+    status_latency_median: "3 ms (deploy baseline)"
+    grant_latency: "4 ms (deploy baseline)"
+    idle_rss: "5.4 MB (deploy baseline); live daemon 4.9 MB at 18:27 EST"
+    db_size_bytes: 204800
+    db_wal_bytes: 1211312
+    chrome_count_baseline: 24
+  current_values:
+    cdp_wait_secs: 10
+    cdp_wait_location: "src/desktops.rs wait_cdp(port, 10) via provision_desktop"
+    drain_tick_secs: 10
+    drain_retry: "fixed 10 s tick plus event drains; no per-request backoff; no failure cap"
+    queue_order_list: "store.list_queued_requests ORDER BY id ASC (arrival)"
+    queue_order_plan: "sched.plan sorts by score (class weight + wait_min/10), then deadline, then created_unix"
+    cancel_logic: "queue.cancel sets request status cancelled without checking for an existing lease"
+    vd_start_arg: "desktops.start_desktop passes the NAME (vd1) to vd-start.sh; script accepts names since test-2 setup, so live calls work, but the playbook contract wants the NUMBER"
+    vd_chrome_script: "CORRECTED 2026-11-06: the real launcher EXISTS at ~/jobs/virtual-desktops/vd-chrome.sh (Nov 2, called by vd-warm.sh). The playbook and FIX-000 checked only ~/jobs/vd-chrome.sh. FIX-004 created ~/jobs/vd-chrome.sh as a thin exec wrapper over the real launcher (interface: vd-chrome.sh vdK [url], takes the NAME, profile ~/.config/chrome-vdK, CDP 9332+K)."
+    vd_start_script: "~/jobs/vd-start.sh accepts vdK names (case vd[0-9]*); starts Xvfb + openbox + x11vnc only, no Chrome"
+    vd_stop_script: "~/jobs/vd-stop.sh accepts vdK names"
+    cdp_port_recorded: "lease row cdp_port is set from desktop_binding at grant time (computed, not probed); warm-desktop actual port is never verified"
+  daemon_live:
+    pid: 129277
+    started: "Fri 2026-11-06 17:46:17 EST"
+    nrestarts: 0
+    active_leases: 0
+    queue_depth: 0
+    desktops_up: 1
+    chrome_count: 24
+    mem_available_mb: 5969
+    battery_pct: 75
+    battery_state: "Recovery"
+  fix_001_investigation:
+    status: "complete - cause established (not a crash)"
+    finding: "The daemon did NOT crash. Both restarts (17:35:53 and 17:46:17 EST Nov 6) were deliberate redeploys by the dashboard-app work: the daemon + mo-cli were redeployed at 17:35 EST (live cmd) and again at 17:46 EST (the :0 display fix). Recorded in this ledger's dashboard_app_2026_11_06.daemon_live_cmd entry, and confirmed by the binary backups mo-daemon.bak-20261106-1735 and -1746."
+    evidence:
+      - "journal 17:35:53: systemd Stopping/Stopped/Started, Consumed 4.161s CPU, 7.2M peak, new PID 123689"
+      - "journal 17:46:17: systemd Stopping/Stopped/Started, Consumed 1.793s CPU, 5.8M peak, new PID 129277"
+      - "dmesg: no OOM killer, no killed process"
+      - "timers: only battery-watch.timer; no timer restarts mo-daemon"
+      - "ledger dashboard_app_2026_11_06.daemon_live_cmd: daemon + mo-cli redeployed 17:35 and 17:46 EST for the live cmd and :0 display fix"
+      - "binary backups mo-daemon.bak-20261106-1735 and -1746 exist"
+      - "NRestarts=0, Restart=on-failure: no systemd auto-restart happened"
+    socket_outage_mechanism: "CONFIRMED by code: src/main.rs runs drain_queue() BEFORE serve() binds the socket. A startup drain over a non-empty queue of failing provisions (vd3 CDP failures, vd-stop usage errors) blocks the socket bind for minutes. The 17:46:17 restart's socket stayed down ~3-4 min (back 17:49:15-17:49:58). FIX-002/003: bind the socket before the startup drain (or background the drain)."
+    memory_peak_note: "Live service peak RSS 49.8M vs normal ~5M. Spike unexplained, but not a crash cause: 7.8 GB RAM, no OOM, daemon stayed up."
+    vd_script_timeline: "vd-start.sh accepted vdK names from 17:40 EST; vd-stop.sh kept rejecting them (usage error) through 17:52 EST, so the vd-stop fix landed during cleanup, not during test-2 setup as reported. The stop_failed alerts come from the old vd-stop.sh."
+    a4_reserving_note: "a4 lease reserving at 17:50:16, gone by 17:50:20: provision failed after the daemon was back up, rollback marked it failed (row still exists as failed, it only left the active view). Not a data-loss bug; visibility/audit gap for FIX-009."
+  fix_012_investigation:
+    status: "complete - no stray Chrome process found, no defect filed"
+    baseline_2026_11_06_18_37: "chrome_count 24 (MO census, comm==chrome; 28 incl. 4 crashpad handlers). Two Chrome instances only: :1 automation (profile chrome-automation, CDP 9222, PID 24107, 14 procs) and :0 kiosk (profile chrome-kiosk, PID 150076, 10 procs). Zero vd Chrome processes. 0 leases, 0 queue, desktops_up 1."
+    spike_reconstruction: "inventory_snapshots: 24 at 17:44:53 -> 38 at 17:45:53 (a14 vd1 grant) -> 64/66 at 17:46:17-17:49:17 (2 desks) -> 82 at 17:50:17-17:52:17 (3 desks) -> 24 at 17:53:17 (1 desk). Spike fully self-resolved within ~1 min of the last release (17:52:40). Nothing lingered."
+    extra_instance: "66-24=42 is ~3 vd Chrome instances on 2 desktops; 82-24=58 is ~4 instances on 3 desks. About 1 extra Chrome instance beyond the desktop count during the spike. Owner of the extra instance CANNOT be established from available records (no process launch log). Not guessed."
+    cold_cycle: "fix012 cold vd-chrome request 18:40:20 EST: 5 failed provisions in ~80 s (drain retry, no backoff), 0 Chrome processes launched, count stayed 24. Cancelled 18:41:42. Leases mo-1794008419-d43af2 .. mo-1794008496-b536d4, all failed, started_desktop 0."
+    warm_cycle: "vd1 warmed by hand (vd-start vd1 + vd-chrome vd1, CDP 9333 responds). Grant 18:42:51, lease mo-1794008571-fbad58, started_desktop 0, count 34 before and after grant (grant adds no procs). Release 18:43:14, count still 34 (warm desktop kept by design). vd-stop vd1, count back to 24, 0 chrome-vd procs. Final check 18:44:28: chrome_count 24, desktops 1, leases 0, queue 0."
+    confound: "One-shot headless Chrome (--headless=new --dump-dom --virtual-time-budget=15000, scoped profile google-chrome-headless/scoped_dirIyawZL, PID 154916, 14 procs) appeared 18:40:52-18:41:12 during the cold cycle and exited on its own. Owner unverified (not MO, not fix012). Proves chrome_count counts ANY Chrome on the VM, not just vd Chromes. TEST-055 should count vd-profile Chrome processes, not total chrome_count."
+    minor_observations:
+      - "mo-cli status chrome_count/desktops_up lag up to 60 s (snapshot cache): read 35/2 after vd1 was already stopped"
+      - "mo-cli request returned E10 read timeout while the daemon was busy provisioning; the request still landed (queued id 33)"
+      - "vd-stop.sh prints '/proc/994/environ: Permission denied' but still stops the desktop"
+  new_bugs_found:
+    - id: "NEW-001"
+      title: "ReclaimProbe.lock_held computed but never used"
+      status: "fixed and verified (server track)"
+      evidence: "src/lease.rs reclaim_all builds ReclaimProbe with lock_held from profile_lock_free, but reclaim_check only reads cdp_ok and chrome_alive. lock_held is never referenced."
+      root_cause: "Dead probe field; the reclaim guard the design intended (do not free a desktop whose Chrome profile lock is held, i.e. Chrome starting) is missing."
+      fix: "reclaim_check now returns KeptStale (profile lock held) when probe.lock_held is set, checked before any release branch. Test reclaim_keeps_when_profile_lock_held passes."
+      severity: "minor"
+    - id: "NEW-002"
+      title: "skip_audits_coalesce test is host-dependent and fails on the VM"
+      status: "fixed and verified (coordinator)"
+      evidence: "cargo test --release on the chromebook-vm: 111 passed, 1 failed. The failing test assumed live MemAvailable under 4096 MB (dev VM ~600 MB); the VM has ~5900 MB, so the 4096 MB request fit, no skip was audited, left 0 vs right 1."
+      root_cause: "Two layers. (1) The test premise is host-dependent. (2) The test-inventory override never reaches the drain: drain_queue overwrites inv.mem_available_mb with the live fresh_mem_available_mb() re-read, which did not consult the override."
+      fix: "fresh_mem_available_mb() consults TEST_INVENTORY in test builds (same as read_single_flight). The test uses a fixed 512 MB inventory via HealthyInv::set_low_mem(). Test-only change, no production code path changed. VM suite: 112 passed, 0 failed, 1 ignored, twice in a row."
+      severity: "minor (test only)"
+  completed_tasks:
+    - "FIX-000"
+    - "FIX-001"
+    - "FIX-012"
+    - "FIX-013"
+    - "FIX-014"
+    - "FIX-002"
+    - "FIX-003"
+    - "FIX-006"
+    - "FIX-007"
+    - "FIX-008"
+    - "FIX-009"
+    - "NEW-001"
+    - "FIX-004"
+    - "FIX-005"
+    - "FIX-010"
+    - "FIX-011"
+    - "FIX-017"
+    - "FIX-015"
+    - "FIX-016"
+    - "FIX-018"
+  server_track_2026_11_06:
+    worker: "server-track subagent, 2026-11-06 ~19:00 EST"
+    baseline_before: "cargo test --release 102 passed, 0 failed, 1 ignored (includes provision worker in-progress desktops.rs tests; ledger baseline was 99)"
+    final_gate: "cargo test --release 110 passed, 0 failed, 1 ignored (two consecutive full runs); cargo clippy --release --all-targets -- -D warnings 0 warnings; cargo fmt --check clean"
+    files_changed:
+      - "src/main.rs"
+      - "src/server.rs"
+      - "src/queue.rs"
+      - "src/sched.rs"
+      - "src/lease.rs"
+    not_touched: "src/desktops.rs and src/core.rs (provision worker owns them); live daemon, binary, and VM mo.db untouched; no commit, no push, no deploy"
+    fix_002:
+      status: "completed_verified"
+      evidence: "serve() binds the socket, then spawns the startup drain on its own thread; main.rs no longer drains before serve. PID logged at startup, clean shutdown marker logged when serve returns Ok. TEST-054 stale_socket_is_removed_on_startup passes."
+    fix_003:
+      status: "completed_verified"
+      evidence: "TEST-043 fifteen_concurrent_requests_keep_daemon_up: 15 concurrent cpu-ram requests, every call answered, health db ok after the storm. No daemon production code changed in this task."
+    fix_006:
+      status: "completed_verified"
+      evidence: "In-memory per-request retry state in the drain loop (no schema change). Backoff 30/60/120/240 s, max 4 retries after first failure, then request marked failed. Each retry logged with request ID, attempt, next retry time, and audited. TEST-045 drain_backoff_schedule passes (delays 30/60/120/240, 5th attempt FailCap)."
+    fix_007:
+      status: "completed_verified"
+      evidence: "3 consecutive identical error codes trip the breaker, request marked failed, trip logged and audited as circuit_breaker with request ID and error code. TEST-046 circuit_breaker_trips_on_three_identical_errors passes; a different code resets the identical-error run."
+    fix_008:
+      status: "completed_verified"
+      evidence: "sched.plan now sorts score desc, then created_unix asc (arrival within class), then deadline. Drain audits every non-fitting entry as a fit skip (coalesced 1/min per reason kind) and logs each grant with request ID and queue position. Fit-first kept; no reorder across priority classes (score still carries class weight). TEST-047 fifo_within_priority_grants_earliest_first passes."
+    fix_009:
+      status: "completed_verified"
+      evidence: "queue.cancel looks up the lease first. Live lease: released cleanly via lease::release (recorded release audit + cancel audit) and request cancelled. Reserving lease: cancel refused, lease left in place (cancel_blocked audit). Reserve/commit/rollback all run in store.with_tx transactions; recover_on_start rolls back stale reserving rows in a transaction. TEST-048 cancel_releases_live_lease_and_refuses_reserving and TEST-049 reserving_always_resolves_to_granted_or_failed pass. Note: the pre-existing test cancel_and_clear_flag_commands expects cancel-after-grant to succeed, so the release-cleanly option from the FIX-009 contract was used, not refuse."
+    fix_011:
+      status: "completed_verified"
+      evidence: "Done by the coordinator after the FIX-004 signal. TEST-051 lease_row_records_cdp_port passes: the lease ROW in the store has cdp_port Some(9333) for a vd1 grant and None for a no-desktop grant (the Grant struct alone was already covered by grant_happy_path). FIX-004 follow-up also done in the same edit: lease.rs grant() now preserves a provision E15 (CDP timeout) instead of re-wrapping every provision error as E04, so the distinct code reaches the caller; test grant_preserves_e15_cdp_timeout passes (E15 surfaces, lease failed, reservation gone). Final gate after this edit: cargo test --release 112 passed, 0 failed, 1 ignored; clippy --release --all-targets 0 warnings; fmt clean."
+    new_001:
+      status: "completed_verified"
+      evidence: "reclaim_check now returns KeptStale (profile lock held: Chrome starting) when probe.lock_held is set, checked before any release branch so a starting Chrome is never freed. Existing cdp_ok/chrome_alive branches unchanged. Test reclaim_keeps_when_profile_lock_held passes."
+    test_hygiene:
+      - "concurrent_drains_grant_once: added the HealthyInv guard the other grant tests use. It flaked in full-suite runs (live load1 spike, no guard) and passed 6/6 alone; pre-existing flake, not caused by these fixes."
+    open_items:
+      - "FIX-011 pending the FIX-004 done signal."
+  provision_track_2026_11_06:
+    worker: "provision-track subagent (w2), 2026-11-06 ~19:00 EST"
+    status: "complete - verified"
+    files: "src/desktops.rs, src/core.rs (E15 only); VM ~/jobs/vd-chrome.sh (new wrapper). No commit, no push, no deploy. Live daemon and mo.db untouched."
+    unblocks: "FIX-011 (server track was awaiting the FIX-004 done signal; FIX-004 is done, see below)."
+    playbook_mismatch: "vd-chrome.sh DOES exist on the VM at ~/jobs/virtual-desktops/vd-chrome.sh (Nov 2, 2796 bytes, called by vd-warm.sh). The playbook/FIX-000 record checked only ~/jobs/vd-chrome.sh. FIX-004 therefore created ~/jobs/vd-chrome.sh as a thin exec wrapper over the real launcher (one launch path, flags never fork), not a second full launcher."
+    vd_chrome_interface: "~/jobs/vd-chrome.sh vdK [url] (K=1..10). Passes the desktop NAME through. Real script validates the display is up, kills Chrome on the profile, launches google-chrome-stable detached with --user-data-dir=~/.config/chrome-vdK and --remote-debugging-port=(9332+K), returns promptly. sha256 ac21e9126201f14f65840839d65ef2f7307dd2d0b08d14bb64157103b8282ee5, 659 bytes."
+    fix_004: "start_desktop (desktops.rs) now calls launch_chrome(id) after vd-start succeeds, then waits CDP. New E15 error code (core.rs, next free after E14) for CDP timeout. Warm path untouched (CDP already responding returns before vd-start). eprintln logging added for launch, CDP wait result, outcome. Desktop release on failure is the existing grant rollback in lease.rs (provision error branch passes started=true, stops the desktop); not changed, out of scope."
+    fix_005: "CDP_WAIT_SECS = 60 (pub const, desktops.rs). No timeout config field exists, so the const is the record. MO_CDP_WAIT_SECS env override exists for tests only; 0 is ignored, never zero or unbounded."
+    fix_010: "start_desktop passes n.to_string() (the NUMBER) to vd-start.sh, not the name. vd-start.sh and the desktop naming scheme unchanged. vd-chrome.sh still gets the NAME (vdK), which is its interface."
+    tests: "cargo test --release: 102 passed, 0 failed, 1 ignored at first run (baseline 99 + 3 new: TEST-044 x2, TEST-050); 110 passed in the final full run after the server track's parallel additions. TEST-044 cold_provision_succeeds_when_chrome_starts (vd9, fake scripts, listener stands in for Chrome, real 60 s default); TEST-044 cold_provision_fails_cleanly_at_cdp_timeout (E15, 1 s override, fast); TEST-044 literal cold_provision_fails_at_sixty_seconds #[ignore] ran once: ok, 60.13 s, E15. TEST-050 vd_start_receives_number_for_vd1 (fake scripts log args: vd-start got '1', vd-chrome got 'vd1'). clippy --release --all-targets: 0 warnings. fmt: clean for src/desktops.rs + src/core.rs (rustfmt on those two files only; the other worker's files were left alone)."
+    vm_hand_test_vd9: "Precheck 0 leases, 0 queue, no GoA worker. vd-start.sh vd9 up (:10, VNC 5911). ~/jobs/vd-chrome.sh vd9 about:blank returned in 1.06 s. CDP up after 2 s: Chrome/156.0.8078.73, webSocketDebuggerUrl present on 9341, profile chrome-vd9. vd-stop.sh vd9: CDP dead, no X10/X11 sockets. Final VM state: daemon up, 0 leases, 0 queue, desktops_up 1, chrome_count 24 (baseline). cb-xfer push failed (rsync exit 3, 3 attempts); file was written via base64 through cb-job.sh instead."
+    caveats:
+      - "E15 is created in desktops.rs but lease.rs grant() re-wraps EVERY provision error as E04 ('provision failed for {desktop}: {message}'), so the E15 code does not surface to callers today; only the distinct message text survives. FIX-011 or a lease.rs owner should preserve the provision error code."
+      - "Chrome launch now also runs on the expand_one path (it calls start_desktop): an expanded desktop gets Chrome, consistent with its purpose. Host adapters route through start_desktop too."
+      - "Not live-verified end to end through the daemon (no deploy per brief): the live grant path with the new binary is still unverified. Needs FIX-017 deploy + a cold vd-chrome grant check."
+  approvals:
+    execution_scope: "granted by Mohammad 2026-11-06 (apply all fixes)"
+    deployment: "pending - release gate at FIX-017 (APR-002 in playbook)"

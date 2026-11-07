@@ -20,7 +20,24 @@ Unix socket only. No HTTP. No LLM on the VM.
 - Unit: ~/.config/systemd/user/mo-daemon.service (enabled)
 - State: ~/jobs/mo/mo.db, mo.sock (600), mo.lock (600)
 - Dashboard: ~/jobs/mo/dashboard.html (rewritten every 30 s)
-- Backups: ~/.local/bin/mo-daemon.bak-20261106-1640, ~/jobs/mo/mo.db.bak-20261106-1640
+- Backups: ~/.local/bin/mo-daemon.bak-20261106-1640, ~/jobs/mo/mo.db.bak-20261106-1640, plus ~/.local/bin/mo-daemon.bak-20261106-1905 and mo-cli.bak-20261106-1905 (fix-plan deploy, 2026-11-06)
+- Build dir on VM: ~/mo-build (source + release build for the fix-plan deploy)
+
+## Fix plan 2026-11-06 (FIX-000..018, deployed 19:06 EST, commit 67a000f)
+
+Deployed daemon PID 166598, binary sha 443665b8. Suite 112 passed, 0 failed, 1 ignored.
+
+- Startup: the socket binds FIRST, then the startup drain runs on its own thread. A restart with a non-empty queue no longer leaves the socket refused for minutes (the 17:46 EST outage cause). PID logged at startup. Clean shutdown marker logged on normal stop.
+- Cold Chrome: a cold vd-chrome provision now launches Chrome via ~/jobs/vd-chrome.sh (thin wrapper over ~/jobs/virtual-desktops/vd-chrome.sh), then waits for CDP. CDP wait is 60 s. Timeout fails with distinct E15 (not E04). Only then is the lease marked active and the CDP port recorded. Verified live: first cold vd-chrome grant ever, CDP 9333 responds.
+- vd-start: MO passes the desktop NUMBER (vd1 becomes 1). vd-chrome.sh still gets the NAME.
+- Drain backoff: retry delays 30, 60, 120, 240 s, max 4 retries, then the request is marked failed. State is in memory only, no schema change.
+- Circuit breaker: 3 consecutive identical error codes stop retries and mark the request failed. Trip logged and audited.
+- FIFO: grants follow arrival order within a priority class. Fit-first kept. Every non-fitting entry is audited as a fit skip. Each grant is logged with request ID and queue position.
+- Cancel: looks up the lease first. A live lease is released cleanly and recorded, then the request is cancelled. A reserving lease blocks the cancel. Reserve, commit, and rollback all run in transactions.
+- CDP port: the lease row records a non-null CDP port for every Chrome lease (null only for no-desktop leases).
+- Reclaim: a desktop whose Chrome profile lock is held (Chrome starting) is kept stale, never freed.
+- Harness: cb-job.sh uses a per-call mktemp output path (parallel calls no longer eat each other's stdout). Yahoo selector list lives at ~/workspace/chromebook-vm/yahoo-price-selectors.js, primary [data-testid='qsp-price'].
+- Regression: stress test 1 (10 agents) PASS, stress test 2 (15 agents) PASS. Both beat the old baselines. Details in implementation/state.yaml (fix_015, fix_016).
 
 ## Daily checks
 
@@ -230,13 +247,26 @@ The unit restarts on failure (Restart=on-failure, 5 s, burst 5 per 60 s).
 
 ## Upgrade
 
-Build on the dev host, transfer, restart. Never build on the VM.
+Build on the VM in ~/mo-build (verified 2026-11-06: the release binary must match the target host). A local build also works; the VM build is the verified path.
 
 ```bash
+# On the dev host: push source (never target/ or .git)
+~/workspace/chromebook-vm/cb-xfer.sh push src/ /home/auto/mo-build/src/
+~/workspace/chromebook-vm/cb-xfer.sh push Cargo.toml /home/auto/mo-build/Cargo.toml
+~/workspace/chromebook-vm/cb-xfer.sh push Cargo.lock /home/auto/mo-build/Cargo.lock
+# On the VM: build, test, then deploy
+cd ~/mo-build && export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --release --features cli   # mo-cli needs --features cli
-~/workspace/chromebook-vm/cb-xfer.sh push target/release/mo-daemon /home/auto/.local/bin/mo-daemon
-~/workspace/chromebook-vm/cb-xfer.sh push target/release/mo-cli /home/auto/.local/bin/mo-cli
-systemctl --user restart mo-daemon   # run on the VM via cb-job.sh
+cargo test --release                   # must be green on the VM before deploy
+cargo clippy --release --all-targets -- -D warnings
+cargo fmt --check
+# Back up the live binaries first, then stop, install, start (via cb-job.sh)
+cp ~/.local/bin/mo-daemon ~/.local/bin/mo-daemon.bak-YYYYMMDD-HHMM
+cp ~/.local/bin/mo-cli ~/.local/bin/mo-cli.bak-YYYYMMDD-HHMM
+systemctl --user stop mo-daemon
+cp ~/mo-build/target/release/mo-daemon ~/.local/bin/mo-daemon
+cp ~/mo-build/target/release/mo-cli ~/.local/bin/mo-cli
+systemctl --user start mo-daemon
 ```
 
 Back up the running binary and mo.db first. Schema migrations run on
@@ -256,7 +286,10 @@ systemctl --user start mo-daemon
 
 The DB backup was copied while the daemon ran, so it may lag the live
 DB by seconds. Prefer a fresh copy after stopping the daemon when the
-rollback is planned. No rollback was used on 2026-11-06.
+rollback is planned. Rollback WAS used and verified on 2026-11-06
+(FIX-017): v0.1.0 restored from the 1905 backups, daemon up and serving,
+then the fix redeployed. Backups from that deploy: mo-daemon.bak-20261106-1905
+(sha 683b9d71, v0.1.0) and mo-cli.bak-20261106-1905.
 
 ## Push to GitHub
 
@@ -290,17 +323,25 @@ after the live deploy passes: v0.1.0 on 16e44943 (2026-11-06).
 | Grants always queued | Capacity or battery | Read mo-cli status. Check MemAvailable, load, battery. |
 | Dashboard stale | Daemon down or write fail | Check daemon status. Check the dashboard mtime. |
 | E05 battery | Low battery | Charge. Or wait. Do not lower gates silently. |
-| CLI cannot connect | Daemon down or wrong socket | Check MO_SOCKET_PATH and daemon status. If the daemon just restarted with a non-empty queue, the startup drain can hold the socket for minutes (see Dashboard app section); wait, do not restart while another session holds leases. |
-| App shows DAEMON: DOWN after a daemon restart | Startup drain blocking serve() | Same as above. The socket returns when the queue drains. |
+| E15: CDP never responded | Cold Chrome did not answer CDP in 60 s | Check the Chrome log on the desktop. Retry later. Distinct from E04. |
+| CLI cannot connect | Daemon down or wrong socket | Check MO_SOCKET_PATH and daemon status. Fixed 2026-11-06: the socket binds before the startup drain, so a restart no longer holds the socket for minutes. |
+| App shows DAEMON: DOWN after a daemon restart | Fixed 2026-11-06 | Socket binds first (see above). If it still shows DOWN, check the daemon is actually up before restarting it. |
 
 ## Open items
 
 - Dashboard tab on :1: SUPERSEDED by the standalone app (no browser for the display). Do not pin a tab.
-- Startup drain blocks the socket (see Dashboard app section): move the startup drain_queue() into a background thread or cap it. Not fixed in this run; needs a daemon restart at a quiet moment (no live leases).
 - TEST-010 (reboot recovery on a real host reboot): not run. No safe window yet.
 - TEST-020 ARM64: blocked. No aarch64 cross linker on the build host or the VM.
 - README on remote main was rewritten by another session during deploy
   (d8ffea0c, 0f3ed2c7, 2026-11-06 16:46-16:48 EST). Kept as is. Synced locally.
-  It claims 94 tests. The count is 99 after Patch 12. Fix the number on
-  the next README touch.
+  It claims 94 tests. The count is 112 after the fix plan (2026-11-06).
+  Fix the number on the next README touch.
 - No Oracle VM exists. No Oracle adapter test has run.
+- TEST-055 should count vd-profile Chrome processes, not total chrome_count.
+  chrome_count counts ANY Chrome on the VM (including one-shot headless runs),
+  so it overstates vd Chrome. Found in FIX-012.
+- mo-cli status chrome/desktops lag live `ps` up to 60 s (snapshot cache).
+  Verify cleanup with live `ps`, not status alone. Found in FIX-015/016.
+- The fix-plan regression drivers live at ~/workspace/mo-fix15/ (fix015.sh,
+  fix016.sh, extract.py). extract.py is Python (throwaway harness, not MO code).
+  MO itself stays Rust-only.

@@ -105,12 +105,19 @@ fn run() -> Result<()> {
             std::thread::sleep(std::time::Duration::from_secs(10));
         });
     }
-    // Drain once at startup: capacity that came back while MO was down
-    // grants queued requests without waiting for a new request.
-    let _ = daemon.drain_queue();
+    // FIX-002: the socket is bound inside serve() before the startup
+    // drain runs (serve spawns the drain after binding). A startup
+    // drain over failing provisions used to block the bind for minutes.
     println!(
-        "mo-daemon up: db={} socket={} host={}",
-        cfg.db_path, cfg.socket_path, cfg.host_name
+        "mo-daemon up: pid={} db={} socket={} host={}",
+        std::process::id(),
+        cfg.db_path,
+        cfg.socket_path,
+        cfg.host_name
     );
-    daemon.serve(&cfg.socket_path)
+    let out = daemon.serve(&cfg.socket_path);
+    if out.is_ok() {
+        eprintln!("mo-daemon: clean shutdown pid={}", std::process::id());
+    }
+    out
 }

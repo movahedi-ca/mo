@@ -149,7 +149,18 @@ fn probe(need_bridge: bool, cfg: &Config) -> Inventory {
 }
 
 /// MemAvailable only. The grant gate re-reads this instead of a full probe.
+/// NEW-002: in test builds the override wins here too. drain_queue
+/// overwrites inv.mem_available_mb with this live re-read, so without
+/// the override the test inventory never reaches the fit check and the
+/// skip test stays host-dependent (it passed only where live MemAvailable
+/// was under 4096 MB).
 pub fn fresh_mem_available_mb() -> i64 {
+    #[cfg(test)]
+    if let Ok(guard) = TEST_INVENTORY.lock() {
+        if let Some(Some(inv)) = &*guard {
+            return inv.mem_available_mb;
+        }
+    }
     if let Ok(mem) = std::fs::read_to_string("/proc/meminfo") {
         for line in mem.lines() {
             if let Some(rest) = line.strip_prefix("MemAvailable:") {
