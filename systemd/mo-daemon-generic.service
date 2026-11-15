@@ -1,0 +1,22 @@
+[Unit]
+Description=MO Local Resource Assistant daemon (generic Linux host)
+After=default.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mo-daemon
+Restart=on-failure
+RestartSec=5
+Environment=MO_DB_PATH=%h/jobs/mo/mo.db
+Environment=MO_SOCKET_PATH=%h/jobs/mo/mo.sock
+Environment=MO_LOCK_PATH=%h/jobs/mo/mo.lock
+Environment=MO_DASHBOARD_PATH=%h/jobs/mo/dashboard.html
+Environment=MO_HOST=generic-linux
+# One daemon only: std File try_lock on MO_LOCK_PATH, error E11 on second start.
+# Install with scripts/install.sh. Do not enable this unit on a host that
+# already runs mo-daemon.service with the same paths.
+
+[Install]
+WantedBy=default.target
