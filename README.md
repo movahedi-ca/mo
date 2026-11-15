@@ -1,4 +1,4 @@
-# MO — Local Resource Assistant
+# MO: Local Resource Assistant
 
 [![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/movahedi-ca/mo?utm_source=readme&utm_medium=badge)
 
@@ -57,11 +57,50 @@ Explicit non-goals: no network exposure, no multi-host coordination, no LLM, no 
 | Version | 0.1.0 |
 | Maturity | Functional core complete; used on chromebook-vm and generic hosts |
 | Platforms | Linux (x86_64 primary; aarch64 cross-build currently blocked on missing linker) |
-| Tests | 123 unit tests passing, 1 ignored (as of 2026-11-06 Step 1 usage measurement) |
+| Tests | 130 unit tests passing, 1 ignored (as of 2026-11-15) |
 | Clippy / fmt | Zero warnings, clean |
 | Known limitations | See [Limitations](#limitations) |
 
 Development is driven by a private V3 playbook. Architecture-review findings (F01–F16) and defects found in adversarial testing have been addressed; see `implementation/` for the ledger and ADRs.
+
+---
+
+## Public launch: generic Linux (2026-11-15)
+
+MO now runs on any plain Linux host, not only on its first two hosts.
+
+- **Generic Linux adapter.** `MO_HOST=generic-linux` detects the host at
+  startup. Battery presence comes from a scan of `/sys/class/power_supply`.
+  The RAM cap comes from `/proc/meminfo`. Desktops stay off unless the
+  operator sets `MO_GENERIC_DESKTOPS=1`. A host with no battery gets no
+  battery gate, and a host with a battery gets the same gate as every
+  other host: MO refuses new leases at 5 percent or less and not charging.
+- **Install.** `scripts/install.sh` copies prebuilt release binaries to
+  `~/.local/bin` and the unit `systemd/mo-daemon-generic.service` to
+  `~/.config/systemd/user`. It never builds. Build first with
+  `cargo build --release --features cli`.
+- **Demo.** `demo/run-demo.sh` starts the daemon on a generic host,
+  fires 15 concurrent lease requests, heartbeats, releases, cancels,
+  and restarts on the same database. A real saved run is in
+  `demo/output-2026-11-15.txt`.
+- **Comparison.** `docs/comparison.md` sets MO next to Slurm, HTCondor,
+  OpenPBS, Kueue, Volcano, Proxmox VE, Apache Guacamole, IBM Spectrum
+  LSF, Altair PBS Professional, Nomad Enterprise, and Leostream, with
+  MO's own limits stated in the same document.
+- **Launch playbook.** `docs/mo-public-launch-playbook.md` holds the
+  full plan, the collision audit, the assumption ledger, and the
+  evidence register for this launch.
+
+### Uninstall (generic install)
+
+```bash
+systemctl --user disable --now mo-daemon-generic.service
+rm ~/.config/systemd/user/mo-daemon-generic.service
+rm ~/.local/bin/mo-daemon ~/.local/bin/mo-cli
+```
+
+The database is yours. Delete the MO state dir (default `~/jobs/mo`)
+only when you want the lease history gone too.
 
 ---
 
