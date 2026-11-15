@@ -1500,7 +1500,7 @@ Every material claim is supported by an artifact or labelled as an assumption, e
 | EVD-010 | TASK-114 / AC-009 | grep output for PolyForm in three files | 2026-11-15 | PASS or FAIL as run | Coordinator |
 | EVD-011 | TASK-111 / AC-010 | Draft files in /home/hatch/workspace/mo-launch | 2026-11-15 | PASS or FAIL as run | Coordinator |
 | EVD-012 | TASK-102 / Gate G1 | Reviewer rounds record in section 12.6 | 2026-11-15 | PASS required before implementation | Reviewer |
-| EVD-013 | TEST-114 / all public text | Em dash grep output on the article, README section, comparison doc, and social drafts | 2026-11-15 | PASS or FAIL as run | Coordinator |
+| EVD-013 | TEST-114 / all public text | Em dash grep output on the article, README section, comparison doc, and social drafts | 2026-11-15 | PASS for text written in this run (0 hits). 24 pre-existing hits in older README body text recorded in section 20.1, not rewritten | Coordinator |
 
 ## 12.3 Persistent implementation ledger
 
@@ -1532,6 +1532,8 @@ Round 1: FAIL with 9 defects. 0 blocker, 1 major, 8 minor. Defects D1 to D9 cove
 Round 2: FAIL on 2 of 4 parts. Collisions PASS. Assumptions PASS. All 9 round 1 defects re-verified PASS. New defects N1 to N5: dependency sources disagreed for TASK-109, TASK-111, TASK-113, and TASK-114, plus a COL-011 conflict. Install paths were not pinned and the unit ExecStart match was not checked. Two sweep dispositions had no owning task. The missing power supply dir case had no test. The upgrade path had no backup and no atomic replace. All 5 were fixed by the coordinator: one dependency set per task across contract, preconditions, and map. Install dirs pinned in section 5.2. ExecStart check added to AC-003 and TEST-106. README content steps added to TASK-109 with TEST-115. TEST-116 added with a section 9.3 rule. Backup dir and atomic rename added to TASK-105 and section 13.4.
 Round 3: FAIL on 2 of 4 parts. N2, N3, and N4 pass. Five propagation misses: the map lacked a direct F to I edge for TASK-106 into TASK-109. The TASK-106 precondition named TASK-104 only. The TASK-114 precondition used a range instead of its dependency set. The ISS-010 disposition still named the git release point. TEST-115 had no traceability row. All 5 were fixed by the coordinator.
 Round 4: a focused re-check of those 5 fixes only. Implementation does not start until a round passes clean on all four parts.
+Round 4 result: PASS on all four parts. Structure clean PASS. Collisions checked PASS. Assumptions verified PASS. Unaddressed issues listed PASS. The reviewer also ran a programmatic map versus contracts check: 21 map edges, 21 contract dependency edges, exact match. Em dash grep zero on all four encodings. Gate G1 passed and implementation started.
+Implementation close, the same four parts for the shipped code: structure clean PASS (suite 130 passed, 0 failed, 1 ignored on local master; 129 passed on the exact pushed tree, which sits on the remote base with one fewer pre-existing test; clippy -D warnings clean; fmt clean). Collisions checked PASS (no chromebook-vm restart or swap during the live job run; no canonical site tree edits by the coordinator; remote main was never force pushed, the launch commits were cherry-picked onto it and recreated through the Git Data API). Assumptions verified PASS (ASM-009 settled by the real push; ASM-010 settled by discovery with the live state left UNVERIFIED on conflicting evidence). Unaddressed issues listed PASS (ISS-001 to ISS-012 stand with owners; LIMIT-001, LIMIT-003, LIMIT-005, and LIMIT-009 stand as named limits).
 
 ## 12.7 Collision audit
 
@@ -1568,8 +1570,8 @@ Every material assumption gets a row. VERIFIED means a command, a file read, or 
 | ASM-006 | mo-cli request grants a cpu-ram lease with desktops 0 on a host with no desktops and no bridge | UNVERIFIED | Owner: Implementer. Settled by TEST-107, the live demo. The V3 ledger shows cpu-ram leases granted on the Oracle adapter pattern, which is evidence, not proof for the generic adapter |
 | ASM-007 | /proc/sys/kernel/random/uuid exists for demo idempotency keys | VERIFIED | cat returned a uuid on the agent VM |
 | ASM-008 | bash and mktemp exist on the target class | VERIFIED | which bash returned /usr/bin/bash. which mktemp returned /usr/bin/mktemp |
-| ASM-009 | A GitHub push route exists without the gh CLI login | UNVERIFIED | Owner: Coordinator. gh auth status returned not logged in. The connector gh.py exists at /home/hatch/workspace/custom-connectors/custom.legacy-github/bin/gh.py. Settled in TASK-109 by a real push and read back, or recorded as the blocker |
-| ASM-010 | The movahedi.ca dev-blog article path and format | UNVERIFIED | Owner: Coordinator. Settled in TASK-110 by discovery in a temp tree from the publish flow. No path is asserted in this playbook before that discovery |
+| ASM-009 | A GitHub push route exists without the gh CLI login | VERIFIED 2026-11-15 | Settled in TASK-109. git HTTPS push failed (no credential) and SSH is proxy-blocked. The push went through the GitHub Git Data API via the connector helper: 5 commits recreated on origin/main, remote HEAD ae05d89, remote tree hash equals the tested worktree tree hash (b319bc65). Read back via the commits API |
+| ASM-010 | The movahedi.ca dev-blog article path and format | SETTLED BY DISCOVERY 2026-11-15, LIVE STATE UNVERIFIED | Settled in TASK-110. Path: src/content/blog/mo-generic-linux-launch.md, collection in src/content.config.ts, rendered by src/pages/developers/blog/[slug].astro. Deploy ran via claim + canonical tree + deploy_site.py, logged version 2026-11-15T17:40:57Z. The article worker's curl checks read 200 with the right title. Two later independent text fetches of the live URL returned 404 and a fresh blog index crawl did not list the article. Live state is therefore UNVERIFIED with conflicting evidence. Exact next step: open the URL in a real browser; if 404, redeploy from the ready file ~/workspace/mo-launch/article-final.md |
 | ASM-011 | The aarch64 cross linker is absent | VERIFIED | which aarch64-linux-gnu-gcc returned missing on the agent VM. Matches TASK-020 in the state ledger. ARM64 stays LIMIT-001 |
 | ASM-012 | The chromebook-vm job run is live tonight | VERIFIED | COL-001 live reads: chrome_count 44, desktops up, bridge pool in use |
 | ASM-013 | A stale socket file blocks a restart | VERIFIED false | src/server.rs line 961 removes the socket file before bind. A stale socket is handled by existing code |
@@ -1887,6 +1889,42 @@ The agent MUST produce the report in this structure at the end of the work:
 - Handover: docs, monitoring, operational owner.
 - Next recommended action: one clear action.
 Verified facts stay separate from assumptions, estimates, recommendations, and unverified claims. The run fills this section with real results before the final chat report. The chat report mirrors it in short form.
+
+## 20.1 Filled report, 2026-11-15
+
+- Outcome: PARTIAL. MO public launch. Final remote commit ae05d89 on movahedi-ca/mo main. The article live state is unverified and the chromebook-vm daemon update is deferred by design. Everything else shipped.
+- Delivered:
+  - This playbook, Gate G1 passed after 4 independent review rounds, committed at docs/mo-public-launch-playbook.md.
+  - GenericLinuxAdapter (src/host.rs): battery by sysfs scan, RAM cap from /proc/meminfo with an 8192 MB fallback, desktops opt-in by MO_GENERIC_DESKTOPS, host names generic-linux, generic, linux. GenericAdapter kept for caller-supplied caps. Core crates unchanged.
+  - Install: scripts/install.sh plus systemd/mo-daemon-generic.service. Prefix install verified on the agent VM, ExecStart rewritten in prefix mode, backup on rerun, alone-script failure with the build command, systemd-analyze verify exit 0.
+  - Demo: demo/run-demo.sh, demo/README.md, real output at demo/output-2026-11-15.txt. 15 requests, 4 granted first wave, 11 queued, 4 heartbeats, 4 releases, 11 cancels, restart recovered. Two real bugs found and fixed by the demo: a bare shell wait also waited for the daemon, and the /tmp tmpfs tripped the disk guard E07 until the workdir moved to the home disk.
+  - Comparison doc: docs/comparison.md, 11 rivals, honest MO limits, no invented claims.
+  - README launch section with uninstall steps and the battery gate line. Title em dash removed. Test count updated to the measured 130.
+  - Push: 5 commits on origin/main (97ff90a, 8de963e, 965dfd9, 914d530, ae05d89) via the Git Data API. Remote tree hash equals the tested worktree tree hash. Repo description set. 10 topics set.
+  - Demand: baseline recorded (stars 0, forks 0, watchers 0, open issues 0, clones 261 and uniques 111 as reported for the trailing 14 days). check-demand.sh ran once and appended one row. Cron mo-demand-weekly-check created, Mondays about 09:40 America/Toronto, first run 2026-11-16. Window ends 2026-12-15; the cron body tells the worker to stop and flag removal after that date.
+  - Social drafts: ~/workspace/mo-launch/social-linkedin.md and social-x.md. Held. Nothing posted, nothing sent.
+  - Article: written in Captain Style, saved at ~/workspace/mo-launch/article-final.md. Deploy attempted by the article worker (claim, canonical tree build, deploy_site.py, logged version 2026-11-15T17:40:57Z).
+- Not delivered:
+  - Article live confirmation: UNVERIFIED. The worker's curl checks read 200 with the correct title. Two coordinator text fetches of the live URL returned 404, and a fresh blog index crawl did not list the article. Next step: open https://movahedi.ca/developers/blog/mo-generic-linux-launch/ in a real browser. If it is 404, redeploy from ~/workspace/mo-launch/article-final.md.
+  - chromebook-vm daemon update: DEFERRED by TASK-113 and Gate G4. A job application run was live on the VM all night (bridge alive, 10 tabs, MO daemon up, 0 active leases, battery 79 percent). No binary swap, no restart. Remaining step, with Mohammad's approval in an idle window: back up ~/.local/bin/mo-daemon on the VM, copy the new release binary in, restart mo-daemon.service, verify mo-cli status and one heartbeat.
+- Validation table:
+  - Gate G1 four-part verdict: PASS, PASS, PASS, PASS (round 4 reviewer).
+  - cargo test --features cli, local master final tree: 130 passed, 0 failed, 1 ignored.
+  - cargo test --features cli, exact pushed tree: 129 passed, 0 failed, 1 ignored. The one-test delta is a pre-existing local-only test on the diverged local base, not a launch change.
+  - cargo clippy --features cli --all-targets -D warnings: clean on both trees.
+  - cargo fmt --check: clean.
+  - Install TEST-106: PASS (prefix files, ExecStart grep, backup rerun, alone-script exit 1, systemd-analyze verify 0).
+  - Demo AC-004: PASS with real output saved.
+  - License grep: PolyForm present in LICENSE (1), Cargo.toml (1), README (2). No relicense.
+  - Em dash grep on text written in this run: 0 hits. Pre-existing README body text outside the launch section holds 24 em dashes from before this run; recorded here, not silently rewritten.
+  - Demand script TEST-113: PASS, exactly one row appended.
+- Performance table: no performance targets were set for this launch. Demo wall time 5 seconds on the agent VM. Test suite about 2 seconds. No baseline comparison is claimed.
+- Changes made: src/host.rs only in shipped code. New files: scripts/install.sh, systemd/mo-daemon-generic.service, demo/run-demo.sh, demo/README.md, demo/output-2026-11-15.txt, docs/comparison.md, docs/mo-public-launch-playbook.md. Edited: README.md. No dependency changes. No schema migration. No config change on any live host.
+- Approvals and deviations: Gate G4 (chromebook-vm daemon restart) not requested; the update is deferred instead. Deviation from COL-002: the article worker used the canonical tree deploy route with a claim rather than the Git Data API route, after reading tree HEAD and the deploy log and finding the article path untouched; pre-existing tree changes were left untouched per its report. The coordinator's independent live check then disputed the result, which is recorded above instead of papered over.
+- Remaining issues and risks: article live state open (owner: main agent, next step above). VM daemon still runs the Nov 12 binary (owner: Mohammad approval). Local master and remote main remain diverged histories with one local-only inventory delta and one local-only test (owner: Mohammad, needs a decision on reconciling the local repo). LIMIT-001 ARM64, LIMIT-003 no packages, LIMIT-005 no cold boot test, LIMIT-009 no live systemd user enable on the agent VM stand.
+- Deployment and recovery status: GitHub main is the deployed repo state; rollback is a revert of ae05d89..97ff90a. chromebook-vm untouched, so no recovery needed there. Site deploy, if it took effect, rolls back through deploy_site.py per the site protocol.
+- Handover: operational owner is Mohammad with AUTO. Demand cron runs to 2026-12-15. Social drafts wait for his tap.
+- Next recommended action: one browser check of the article URL, then decide the chromebook-vm daemon update window.
 
 # 21. Reusable decision and issue templates
 
