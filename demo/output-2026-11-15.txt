@@ -1,0 +1,28 @@
+== MO demo: generic-linux host ==
+workdir: /home/hatch/.mo-demo.JVx6Vy
+daemon up: pid 35789 host generic-linux
+  "daemon": "up",
+== firing 15 concurrent cpu-ram requests (1 core, 256 MB, 5 min, P2) ==
+first wave: granted 4, queued or other 11
+== heartbeat and release for each grant ==
+heartbeats ok: 4, releases ok: 4
+== cancel requests still queued ==
+cancelled: 11
+== status before restart ==
+  "active_leases": 0,
+  "daemon": "up",
+== restart smoke: same database ==
+daemon restarted: pid 36138
+  "active_leases": 0,
+  "daemon": "up",
+lease rows readable after restart: 0
+== result table ==
+requests fired               15
+granted first wave           4
+queued first wave            11
+heartbeats ok                4
+releases ok                  4
+queued cancelled             11
+restart recovered            yes, status served
+wall seconds                 5
+demo workdir kept for inspection: /home/hatch/.mo-demo.JVx6Vy
